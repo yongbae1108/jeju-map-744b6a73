@@ -3,14 +3,18 @@
   'use strict';
   const say = t => { const el = document.getElementById('loadingText'); if (el) el.textContent = t; };
   try {
+    let got = 0;
     const get = async (p, json) => {
       const r = await fetch(p, {cache: 'no-cache'});
       if (!r.ok) throw new Error(p + ' ' + r.status);
-      return json ? r.json() : new Uint8Array(await r.arrayBuffer());
+      const v = json ? await r.json() : new Uint8Array(await r.arrayBuffer());
+      say('지도 자료를 여는 중… ' + (++got) + '/6');
+      return v;
     };
     const meta = await get('data/meta.json', true);
     const [terrain, roads, bld, cover, places] = await Promise.all([get('data/terrain.bin'), get('data/roads.bin'), get('data/bld.bin'),
       get('data/cover.bin'), get('data/places.json', true)]);
+    window.__bootData = performance.now();
     say('도로와 건물을 놓는 중…');
     await new Promise(r => setTimeout(r, 30));
     const T = Object.assign({}, meta.terrain, {grid: new Uint16Array(terrain.buffer)});
@@ -54,7 +58,8 @@ const ptList = (a, n) => Array.isArray(a) ? a.filter(p => Array.isArray(p) && p.
 const airOf = o => o && ptList(o.path, 3).length > 1 ? {path: ptList(o.path, 3), taxi: ptList(o.taxi, 2)} : null;
 // Saved trips outlive app updates: every stored trip carries the schema version it was written with, older versions are
 // migrated step by step here, and fields this version does not know are kept so an update never drops them.
-const APP_VERSION = '2026.11.27', SCHEMA = 2;
+const APP_VERSION = '2026.11.27-2', SCHEMA = 2;
+let bootSec = '', dataSec = '';
 const MIGRATE = {
   1: o => { o.air = o.air !== false; return o; }      // v1 (before 2026-11-27): no airport flights yet -> on by default
 };
@@ -1541,11 +1546,14 @@ function startPlay(opt){
   const tl = buildTimeline(days);
   if (!tl.segs.length) return toast('동선을 재생하려면 장소가 2곳 이상이거나, 공항 도착·출발이 켜져 있어야 합니다.');
   setOrbit(false);
-  play = Object.assign(tl, {t: 0, k: -1, markKey: '', s: 0, paused: false, view: null, anim: 0,
+  const prevSnap = play ? play.prevSnap : snap;
+  play = Object.assign(tl, {t: 0, k: -1, markKey: '', s: 0, paused: false, view: null, anim: 0, prevSnap,
     baseDist: Math.min(goal.dist, 9), basePol: Math.max(goal.pol, 0.95)});
   goal.dist = play.baseDist; goal.pol = play.basePol;
   mover.visible = true; $('hud').hidden = false;
-  setSnap('peek');
+  // playback wants the map: the sheet folds to its grip and, on a phone, the masthead gives its place to the bar
+  document.body.classList.add('playing');
+  setSnap('mini');
   buildHudDays();
   let t = 0;
   if (opt.day != null) { const a = tl.dayAt.find(x => x.d === opt.day); if (a) t = a.t; }
@@ -1588,7 +1596,13 @@ function enterSeg(seg){
   for (const l of MODELS.walk.userData.limbs) l.rotation.x = 0;
 }
 function pausePlay(p){ if (play) { play.paused = p; playUi(); } }
-function stopPlay(){ play = null; scrub = null; mover.visible = false; $('hud').hidden = true; playUi(); updatePlaceCard(); dirty = true; }
+function stopPlay(){
+  const back = play && play.prevSnap;
+  play = null; scrub = null; mover.visible = false; $('hud').hidden = true;
+  document.body.classList.remove('playing');
+  if (snap === 'mini' && back && back !== 'mini' && !view && !state.pick) setSnap('peek');   // the list comes back as it was
+  playUi(); updatePlaceCard(); dirty = true;
+}
 function playUi(){
   const on = !!play && !play.paused;
   btnPlay.innerHTML = (on ? IC.pause : IC.play) + '<span>' + (play ? (on ? '일시정지' : '이어서 재생') : '동선 재생') + '</span>';
@@ -1815,19 +1829,25 @@ function commit(keepPanel){
 const sheet = $('sheet'), scroller = $('sheetScroll');
 const isDesk = () => matchMedia('(min-width: 900px)').matches;
 let snap = 'peek', peekPx = 280, view = null, legOpen = null;
+// snaps, top to bottom: full, half, peek (day head, chips and the peek line), mini (only the mosaic band and the grip
+// above the dock: the most map), hide (map picking)
+const miniPx = () => $('dock').offsetHeight + 34;
 function snapY(s){
-  const H = sheet.offsetHeight, vis = s === 'full' ? H : s === 'half' ? Math.min(H, innerHeight * 0.62) : s === 'hide' ? 0 : peekPx;
+  const H = sheet.offsetHeight, vis = s === 'full' ? H : s === 'half' ? Math.min(H, innerHeight * 0.62) : s === 'hide' ? 0 : s === 'mini' ? miniPx() : peekPx;
   return Math.max(0, H - vis);
 }
 function setSnap(s){
+  const wasMini = snap === 'mini';
   snap = s;
   if (isDesk()) return;
   sheet.style.setProperty('--sy', snapY(s) + 'px');
   document.body.classList.toggle('sheet-full', s === 'full');     // the map controls would peek out above the sheet
+  document.body.classList.toggle('sheet-mini', s === 'mini');
   $('grip').setAttribute('aria-expanded', String(s === 'half' || s === 'full'));
-  $('grip').setAttribute('aria-label', s === 'peek' ? '일정 목록 펼치기' : '일정 목록 접기');
-  if (s === 'peek' && !view) scroller.scrollTop = 0;
+  $('grip').setAttribute('aria-label', s === 'mini' ? '일정 펼치기' : s === 'peek' ? '일정 목록 펼치기' : '일정 목록 접기');
+  if ((s === 'peek' || s === 'mini') && !view) scroller.scrollTop = 0;
   if (!view) renderPeek();
+  if (wasMini !== (s === 'mini')) resize();      // the map's centre follows the sheet's top
 }
 // the folded sheet shows the grip, the day head, the day chips and the peek line; the dock floats over its bottom
 function measurePeek(){
@@ -1835,7 +1855,7 @@ function measurePeek(){
   if ($('vList').hidden) return;          // a sub view is open: keep the last measurement
   peekPx = Math.round(clamp(pk.offsetTop + pk.offsetHeight + 6 + $('dock').offsetHeight, 200, innerHeight * 0.5));
 }
-function mapInset(){ return isDesk() ? 0 : peekPx; }
+function mapInset(){ return isDesk() ? 0 : snap === 'mini' ? miniPx() : peekPx; }
 let sdrag = null;
 function sheetDown(e){
   if (isDesk() || e.button > 0 || e.target.closest('input,textarea,select')) return;
@@ -1849,29 +1869,31 @@ function sheetMove(e){
     sdrag.moved = true; sheet.classList.add('dragging');
     try { sdrag.el.setPointerCapture(e.pointerId); } catch (err) {}
   }
-  sheet.style.setProperty('--sy', clamp(sdrag.sy0 + dy, 0, sheet.offsetHeight - 120) + 'px');
+  sheet.style.setProperty('--sy', clamp(sdrag.sy0 + dy, 0, sheet.offsetHeight - miniPx()) + 'px');
   const now = performance.now();
   sdrag.v = (e.clientY - sdrag.y) / Math.max(1, now - sdrag.t); sdrag.y = e.clientY; sdrag.t = now;
 }
 function sheetUp(e){
   if (!sdrag || e.pointerId !== sdrag.id) return;
   const d = sdrag; sdrag = null;
-  if (!d.moved) { if (d.el === $('grip') && e.type === 'pointerup') setSnap(snap === 'peek' ? 'half' : 'peek'); return; }
+  if (!d.moved) { if (d.el !== $('dayhead') && e.type === 'pointerup') gripTap(); return; }
   sheet.classList.remove('dragging');
-  const cur = d.sy0 + e.clientY - d.y0, order = ['full', 'half', 'peek'], ys = order.map(snapY);
+  const cur = d.sy0 + e.clientY - d.y0, order = ['full', 'half', 'peek', 'mini'], ys = order.map(snapY);
   let k = 0;      // ys grow from full to peek; a fling goes to the next stop in its direction, otherwise the nearest
   ys.forEach((y, i) => { if (Math.abs(y - cur) < Math.abs(ys[k] - cur)) k = i; });
   if (d.v < -0.45) { const up = ys.map((y, i) => y < cur - 10 ? i : -1).filter(i => i >= 0); k = up.length ? up[up.length - 1] : 0; }
   else if (d.v > 0.45) { const i = ys.findIndex(y => y > cur + 10); k = i < 0 ? order.length - 1 : i; }
-  setSnap(view && order[k] === 'peek' ? 'half' : order[k]);
+  setSnap(view && (order[k] === 'peek' || order[k] === 'mini') ? 'half' : order[k]);
 }
-for (const el of [$('grip'), $('dayhead')]) {
+// a tap on the grip steps open (mini -> peek -> half) and closes back to peek from above
+const gripTap = () => setSnap(snap === 'mini' ? 'peek' : snap === 'peek' ? 'half' : view ? 'half' : 'peek');
+for (const el of [$('grip'), $('dayhead'), sheet.querySelector('.mosaic')]) {
   el.addEventListener('pointerdown', sheetDown);
   el.addEventListener('pointermove', sheetMove);
   el.addEventListener('pointerup', sheetUp);
   el.addEventListener('pointercancel', sheetUp);
 }
-$('grip').addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setSnap(snap === 'peek' ? 'half' : 'peek'); } });
+$('grip').addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); gripTap(); } });
 
 /* ---- sub views inside the sheet: search, stop, day, trip ---- */
 // build(v) may return an element to focus; focusing happens after the view is shown, still inside the tap,
@@ -1954,25 +1976,30 @@ function addPlace(p, d, thenEdit){
   toast('‘' + p.name + '’' + josa(p.name, '을', '를') + ' ' + (d + 1) + '일차 ' + (i + 1) + '번째로 넣었습니다.');
 }
 
-function openSearch(d0){
+// rep = {d, i}: find a new position for an existing stop instead of adding one (from the stop editor). Its time, memo
+// and travel settings stay; the name and the position come from the chosen result.
+function openSearch(d0, rep){
   let target = d0 != null ? d0 : state.day >= 0 ? state.day : trip.days.length - 1;
+  const old = rep && trip.days[rep.d] && trip.days[rep.d].stops[rep.i];
+  if (rep && !old) return;
+  const choose = p => rep ? replaceStop(rep.d, rep.i, p) : addPlace(p, target);
   openView('search', v => {
     const inp = h('input', {class: 'in', id: fid(), type: 'search', placeholder: '장소 이름 (예: 성산일출봉, 동문시장)', 'aria-label': '장소 이름으로 찾기',
-      enterKeyHint: 'search', autocomplete: 'off', spellcheck: false});
+      enterKeyHint: 'search', autocomplete: 'off', spellcheck: false, value: rep && old.name !== '지도에서 고른 곳' ? old.name : ''});
     const days = h('div', {class: 'daypick', role: 'radiogroup', 'aria-label': '넣을 날'});
     const res = h('div', {'aria-live': 'polite'});
     const drawDays = () => {
       days.textContent = '';
-      if (trip.days.length < 2) return;
+      if (trip.days.length < 2 || rep) return;
       put(days, h('span', null, '넣을 날'), trip.days.map((_, d) => h('button', {class: 'chip', type: 'button', role: 'radio', style: '--c:' + dayColor(d),
         'aria-checked': String(d === target), onclick: () => { target = d; drawDays(); }}, (d + 1) + '일차')));
     };
     const item = (p, sub, q) => {
       const at = q ? p.name.indexOf(q) : -1;
       const nm = at < 0 ? esc(p.name) : esc(p.name.slice(0, at)) + '<mark>' + esc(q) + '</mark>' + esc(p.name.slice(at + q.length));
-      return h('li', null, h('button', {class: 'res', type: 'button', onclick: () => addPlace(p, target)},
+      return h('li', null, h('button', {class: 'res', type: 'button', onclick: () => choose(p)},
         h('span', {class: 'r-main'}, h('span', {class: 'r-name', html: nm}), h('span', {class: 'r-sub'}, sub)),
-        h('span', {class: 'r-add', html: IC.plus, 'aria-hidden': 'true'})));
+        h('span', {class: 'r-add', html: rep ? IC.target : IC.plus, 'aria-hidden': 'true'})));
     };
     // the two other ways in sit right under the box: pick on the map (offline) and address search (online, Esri)
     const netOut = h('div', {'aria-live': 'polite'});
@@ -1993,10 +2020,13 @@ function openSearch(d0){
     };
     inp.addEventListener('input', draw);
     inp.addEventListener('keydown', e => { if (e.key === 'Enter') { const b = res.querySelector('.res'); if (b) b.click(); } });
-    put(v, vhead('장소 추가'), h('div', {class: 'searchbox'}, h('span', {html: IC.search, 'aria-hidden': 'true'}), inp), days,
+    put(v, rep ? vhead('위치 다시 찾기', () => openStop(rep.d, rep.i), h('span', {class: 'n', style: '--c:' + dayColor(rep.d)}, String(rep.i + 1)))
+        : vhead('장소 추가'),
+      rep ? h('p', {class: 'hint', style: 'margin-bottom:10px'}, '‘' + old.name + '’의 새 위치를 고르세요. 시간, 메모, 이동수단은 그대로 둡니다.') : null,
+      h('div', {class: 'searchbox'}, h('span', {html: IC.search, 'aria-hidden': 'true'}), inp), days,
       h('div', {class: 'row2', style: 'margin-top:10px'},
         h('button', {class: 'btn', type: 'button', html: IC.target + '<span>지도에서 고르기</span>',
-          onclick: () => startPick({mode: 'add', d: target, name: inp.value.trim()})}), addrBtn),
+          onclick: () => startPick(rep ? {mode: 'move', d: rep.d, i: rep.i} : {mode: 'add', d: target, name: inp.value.trim()})}), addrBtn),
       h('p', {class: 'hint', style: 'margin-top:6px'}, '주소로 찾기는 인터넷이 필요하고, 검색어가 Esri(ArcGIS) 주소 검색으로 전송됩니다.'),
       netOut, res);
     drawDays(); draw();
@@ -2063,12 +2093,24 @@ function openStop(d, i){
       h('h3', {class: 'group-h'}, '위치'),
       h('div', {class: 'group'},
         h('p', {class: 'hint'}, areaOf(s.lat, s.lon) + ' · ' + s.lat.toFixed(5) + ', ' + s.lon.toFixed(5)),
+        h('button', {class: 'btn', type: 'button', html: IC.search + '<span>장소·주소 검색으로 다시 찾기</span>', onclick: () => openSearch(d, {d, i})}),
         h('button', {class: 'btn', type: 'button', html: IC.target + '<span>지도에서 위치 다시 정하기</span>', onclick: () => startPick({mode: 'move', d, i})})),
       h('h3', {class: 'group-h'}, '동선 재생'),
       h('div', {class: 'group'},
         h('button', {class: 'btn', type: 'button', html: IC.play + '<span>여기부터 동선 재생</span>', onclick: () => { closeView(); startPlay({stop: {d, i}}); }})),
       h('button', {class: 'btn danger wide', type: 'button', style: 'margin-top:8px', html: IC.trash + '<span>이 장소 삭제</span>', onclick: () => askRemove(d, i)}));
   });
+}
+// a stop gets a new name and position from a search result; 되돌리기 puts the old ones back
+function replaceStop(d, i, p){
+  const s = trip.days[d] && trip.days[d].stops[i];
+  if (!s) return;
+  const was = {name: s.name, lat: s.lat, lon: s.lon, walk: s.walk};
+  s.name = String(p.name).slice(0, 60); s.lat = +(+p.lat).toFixed(5); s.lon = +(+p.lon).toFixed(5);
+  if (s.walk && hav(was, s) > 0.3) s.walk = null;          // a walking path the stop brought along belonged to the old spot
+  state.sel = {d, i};
+  closeView(true); commit(); openStop(d, i); flyTo(s);
+  toast('위치를 ‘' + s.name + '’' + josa(s.name, '으로', '로') + ' 바꿨습니다.', '되돌리기', () => { Object.assign(s, was); commit(); openStop(d, i); flyTo(s); });
 }
 function removeStop(d, i){
   const fromView = !!view, s = trip.days[d].stops.splice(i, 1)[0];
@@ -2176,7 +2218,8 @@ function openTrip(){
         h('p', {class: 'hint'}, '지도는 끌어서 옮기고, 두 손가락으로 확대·회전합니다. 컴퓨터에서는 우클릭이나 Shift를 누른 채 끌면 회전과 기울기, 키보드는 방향키·Q/E·R/F·+/−를 씁니다.'),
         h('p', {class: 'hint'}, '경로와 이동 시간은 지도에 담긴 도로망으로 계산한 추정값입니다. 일방통행과 실시간 교통은 반영하지 않습니다.')),
       h('p', {class: 'credit'}, '지형 Mapzen Terrain Tiles (SRTM·GMTED2010·ETOPO1 등) · 도로·건물·숲·장소 © OpenStreetMap contributors (ODbL) · 주소 검색 Esri ArcGIS',
-        h('br'), '앱 버전 ' + APP_VERSION + (META && META.built ? ' · 자료 ' + META.built : '')));
+        h('br'), '앱 버전 ' + APP_VERSION + (META && META.built ? ' · 자료 ' + META.built : '') +
+          (bootSec ? ' · 이번 시작 ' + bootSec + '초(자료 ' + dataSec + '초)' : '')));
   });
 }
 
@@ -2545,6 +2588,8 @@ if (allStops.length) fitStops(state.day >= 0 ? trip.days[state.day].stops : allS
 Object.assign(cam, goal); cam.ty = goal.ty = groundY(goal.tx, goal.tz);
 requestAnimationFrame(frame);
 if (document.fonts && document.fonts.ready) document.fonts.ready.then(relayout);
+// how long this start took (shown in 여행 정보): the whole start, and the part spent reading the map data
+bootSec = (performance.now() / 1000).toFixed(1); dataSec = ((window.__bootData || 0) / 1000).toFixed(1);
 $('loading').classList.add('done'); setTimeout(() => $('loading').remove(), 500);
 // a stored trip this version could not read was set aside, never overwritten: offer it as a file
 if (rescued) setTimeout(() => toast('저장된 일정을 이 버전에서 읽지 못해 따로 보관해 두었습니다.', '파일로 받기', () => {

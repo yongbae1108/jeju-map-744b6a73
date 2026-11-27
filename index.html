@@ -288,6 +288,11 @@ textarea.in{padding:10px 12px;min-height:72px;resize:vertical;line-height:1.5}
 #toast button{min-height:36px;padding:0 4px;border:0;background:none;color:#f3cf73;font-weight:700;pointer-events:auto}
 #toast:not(.on) button{pointer-events:none}
 body.sheet-full #ctl,body.sheet-full #hud{visibility:hidden}
+/* during playback on a phone the masthead steps aside and the progress bar takes its place at the top */
+@media (max-width:899px){
+  body.playing #mast{visibility:hidden}
+  body.playing #hud{top:calc(var(--sat) + 12px)}
+}
 
 /* ---------- confirm dialog ---------- */
 .scrim{position:fixed;inset:0;z-index:12;display:grid;place-items:center;padding:24px;background:rgba(33,48,43,.45);animation:fadein .18s}
