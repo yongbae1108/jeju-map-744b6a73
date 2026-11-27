@@ -1,0 +1,45 @@
+{
+ "version": "20261126",
+ "terrain": {
+  "w": 684,
+  "h": 480,
+  "lon0": 126.1,
+  "lon1": 127.02,
+  "lat0": 33.62,
+  "lat1": 33.08,
+  "offset": 200
+ },
+ "roads": [
+  75508,
+  80470,
+  323684,
+  229346,
+  207586
+ ],
+ "nb": 25544,
+ "tile": 2.5,
+ "places": 12858,
+ "attribution": "Map data (c) OpenStreetMap contributors (ODbL); elevation: Terrarium tiles (Mapzen/AWS Terrain Tiles)",
+ "files": {
+  "terrain.bin": {
+   "bytes": 656640,
+   "sha256": "bd92956c3a1cd8818f4fe5ae8fa4d2a7e0d227f44e1c51825a7f357cc0ef4b7c"
+  },
+  "roads.bin": {
+   "bytes": 916594,
+   "sha256": "e23e3fbd5bd6f5376837a83259d7f6488e4321f73dbc1e24690416956b4f58e1"
+  },
+  "bld.bin": {
+   "bytes": 871572,
+   "sha256": "e29377d540a55be00caf59cd91bfd4af2dbe80d789115a41033a3c7f7088e28b"
+  },
+  "cover.bin": {
+   "bytes": 97269,
+   "sha256": "eeb1d070f3d9e37b0c4708dae9b80214d7abe03ef16755134d403eac74856e64"
+  },
+  "places.json": {
+   "bytes": 627370,
+   "sha256": "a1023b485656dd7bfd0474570fde82af5035e202cc9ecbf873cecff0731815c1"
+  }
+ }
+}
