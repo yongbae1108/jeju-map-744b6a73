@@ -58,7 +58,7 @@ const ptList = (a, n) => Array.isArray(a) ? a.filter(p => Array.isArray(p) && p.
 const airOf = o => o && ptList(o.path, 3).length > 1 ? {path: ptList(o.path, 3), taxi: ptList(o.taxi, 2)} : null;
 // Saved trips outlive app updates: every stored trip carries the schema version it was written with, older versions are
 // migrated step by step here, and fields this version does not know are kept so an update never drops them.
-const APP_VERSION = '2026.11.27-5', SCHEMA = 2;
+const APP_VERSION = '2026.11.27-7', SCHEMA = 2;
 let bootSec = '', dataSec = '';
 const MIGRATE = {
   1: o => { o.air = o.air !== false; return o; }      // v1 (before 2026-11-27): no airport flights yet -> on by default
@@ -74,6 +74,8 @@ const extra = (o, known) => {
   if (o && typeof o === 'object') for (const k in o) if (!known.includes(k) && k.length < 40) { try { if (JSON.stringify(o[k]).length <= 4000) r[k] = o[k]; } catch (e) {} }
   return r;
 };
+// how a stop is reached from the one before ('' = car): also the vehicle that moves in the playback
+const BY = ['bus', 'walk', 'bike', 'ferry', 'plane'];
 const STOP_KEYS = ['id', 'name', 'lat', 'lon', 'time', 'stay', 'memo', 'dep', 'coast', 'by', 'stroll', 'walk', 'airIn', 'airOut', 'done', 'doneAt'];
 // every stop carries a short id that stays with it when it moves; photos (kept outside the trip) point at it
 const newId = () => Math.random().toString(36).slice(2, 10).padEnd(8, '0');
@@ -98,8 +100,8 @@ function sanitizeTrip(o){
       done: s.done === true, doneAt: s.done === true && /^\d{2}:\d{2}$/.test(s.doneAt) ? s.doneAt : '',
       lat: clamp(+s.lat, T.lat1, T.lat0), lon: clamp(+s.lon, T.lon0, T.lon1),
       time: /^\d{2}:\d{2}$/.test(s.time) ? s.time : '', memo: String(s.memo || '').slice(0, 200),
-      // how this stop is reached from the one before: '' car (default), 'bus', 'walk'; coast = car along the coast
-      dep: /^\d{2}:\d{2}$/.test(s.dep) ? s.dep : '', coast: s.coast === true, by: s.by === 'bus' || s.by === 'walk' ? s.by : '',
+      // how this stop is reached from the one before: '' car (default), 'bus', 'walk', 'bike', 'ferry', 'plane'; coast = car along the coast
+      dep: /^\d{2}:\d{2}$/.test(s.dep) ? s.dep : '', coast: s.coast === true, by: BY.includes(s.by) ? s.by : '',
       stroll: s.stroll === true,
       walk: s.walk && ptList(s.walk.path, 2).length > 1 ? {label: String(s.walk.label || '걷기').slice(0, 30), path: ptList(s.walk.path, 2)} : null,
       airIn: airOf(s.airIn), airOut: airOf(s.airOut)}))}));
@@ -472,6 +474,11 @@ function routeLeg(a, b, noCache){         // noCache: a one-off start (the phone
   }
   if (!noCache) legCache.set(key, leg);
   return leg;
+}
+// a boat or a plane picked for a leg leaves the roads: it goes straight across (the plane flies an arc in the playback)
+function legOf(a, b){
+  if (b.by !== 'ferry' && b.by !== 'plane') return routeLeg(a, b);
+  return {kind: b.by === 'ferry' ? 'ferry' : 'air', km: hav(a, b), min: null, pts: [[toX(a.lon), toZ(a.lat)], [toX(b.lon), toZ(b.lat)]]};
 }
 // Driving minutes and km from one road node to several others at once: one Dijkstra that stops when every target is
 // settled (the day's reordering needs all pairs; n searches instead of n² A*).
@@ -1163,6 +1170,7 @@ const IC = {
   open: svg('<path d="M12 3v12M7 10l5 5 5-5"/><path d="M5 17v3h14v-3"/>'),
   globe: svg('<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18"/>'),
   chev: svg('<path d="M6 9l6 6 6-6"/>'),
+  bike: svg('<circle cx="5.5" cy="16" r="3.5"/><circle cx="18.5" cy="16" r="3.5"/><path d="M5.5 16h5l5.5-7H9l-3.5 7M10.5 16L8.5 9.5M16 9l2.5 7M7 7.5h3.5M16 9l-.8-3H18"/>'),
   plane: svg('<path d="M10.5 3.5c0-.8.7-1.5 1.5-1.5s1.5.7 1.5 1.5V9l7 4v2l-7-2v4.5l2 1.5v1.5L12 20l-3.5 1.5V20l2-1.5V13l-7 2v-2l7-4z"/>'),
   addPin: svg('<path d="M12 21s-7-6.2-7-11a7 7 0 0 1 14 0c0 4.8-7 11-7 11z"/><path d="M12 7v6M9 10h6"/>'),
   locate: svg('<circle cx="12" cy="12" r="6.5"/><circle cx="12" cy="12" r="2.2" fill="currentColor"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/>'),
@@ -1216,7 +1224,7 @@ const dotMat = new THREE.MeshBasicMaterial({color: 0x21302b});
 // playback markers: small low-poly models, nose along +z, resting on y = 0. Only the one for the current
 // segment is shown; `paint` takes the day's colour. MODEL_PX = on-screen pixels per model unit.
 const paint = new THREE.MeshStandardMaterial({color: 0xb3402b, emissive: 0xb3402b, emissiveIntensity: 0.18, roughness: 0.45, metalness: 0.1});
-const MODEL_PX = {car: 22, bus: 19, ferry: 20, walk: 30, plane: 19};
+const MODEL_PX = {car: 22, bus: 19, ferry: 20, walk: 30, plane: 19, bike: 26};
 const MODELS = {};
 const mover = new THREE.Group();
 mover.rotation.order = 'YXZ'; mover.visible = false; scene.add(mover);
@@ -1273,6 +1281,30 @@ let moverMode = 'car';
   box(g, 0.06, 0.72, 0.58, paint, 0, 0.42, -1.95);                                      // fin
   const eng = new THREE.CylinderGeometry(0.12, 0.12, 0.5, 12); eng.rotateX(Math.PI / 2);
   for (const x of [-0.78, 0.78]) add(g, eng, grey, x, -0.2, 0.32);
+  // bicycle and rider: frame in the day colour, legs that follow the pedals (userData.pedal(crank angle))
+  g = MODELS.bike = new THREE.Group();
+  const wheel = new THREE.TorusGeometry(0.34, 0.045, 8, 22); wheel.rotateY(Math.PI / 2);
+  for (const z of [-0.56, 0.56]) add(g, wheel, tyre, 0, 0.34, z);
+  // a thin rod from (y1, z1) to (y2, z2) in the bike's side plane
+  const rod = (mat, r, y1, z1, y2, z2, x) => { const m = add(g, new THREE.CylinderGeometry(r, r, Math.hypot(y2 - y1, z2 - z1), 6), mat, x || 0, (y1 + y2) / 2, (z1 + z2) / 2); m.rotation.x = Math.atan2(z2 - z1, y2 - y1); return m; };
+  const RA = [0.34, -0.56], BB = [0.3, -0.04], SE = [0.8, -0.2], HD = [0.8, 0.4], FA = [0.34, 0.56];
+  for (const [p, q] of [[RA, BB], [RA, SE], [BB, SE], [SE, HD], [BB, HD], [HD, FA]]) rod(paint, 0.035, p[0], p[1], q[0], q[1]);
+  rod(dark, 0.025, 0.8, 0.4, 0.92, 0.36);                                               // stem
+  box(g, 0.5, 0.045, 0.05, dark, 0, 0.92, 0.36);                                         // handlebar
+  box(g, 0.15, 0.05, 0.28, dark, 0, 0.86, -0.22);                                        // saddle
+  const lean = 0.55, hip = [0.9, -0.2], up = k => [hip[0] + k * Math.cos(lean), hip[1] + k * Math.sin(lean)];
+  box(g, 0.38, 0.5, 0.24, paint, 0, up(0.27)[0], up(0.27)[1]).rotation.x = lean;      // jacket
+  const head = up(0.66), sh = up(0.48);
+  add(g, new THREE.SphereGeometry(0.15, 16, 12), skin, 0, head[0], head[1]);
+  box(g, 0.32, 0.08, 0.32, white, 0, head[0] + 0.13, head[1] + 0.02).rotation.x = lean * 0.3;   // cap
+  for (const x of [-0.17, 0.17]) rod(paint, 0.05, sh[0], sh[1], 0.92, 0.36, x);          // arms to the bar
+  const bikeLegs = [-0.12, 0.12].map(x => { const p = new THREE.Group(); p.position.set(x, hip[0], hip[1]); const geo = new THREE.BoxGeometry(0.15, 1, 0.15); geo.translate(0, -0.5, 0); p.add(new THREE.Mesh(geo, dark)); g.add(p); return p; });
+  g.userData.pedal = a => bikeLegs.forEach((p, k) => {
+    const t = a + k * Math.PI, dy = BB[0] + Math.cos(t) * 0.16 - hip[0], dz = BB[1] + Math.sin(t) * 0.16 - hip[1];
+    p.rotation.x = Math.atan2(-dz, -dy); p.scale.y = Math.hypot(dy, dz);              // hip to pedal
+  });
+  g.userData.legs = bikeLegs; g.userData.pedal(0.6);
+  halo(g, 0.5, 1.0);
   for (const m of Object.values(MODELS)) { m.visible = false; mover.add(m); }
   MODELS.car.visible = true;
 })();
@@ -1355,7 +1387,7 @@ function rebuildScene(){
     });
     // the day's route: each leg densified so it can be draped on the terrain
     const L = [];
-    for (let i = 0; i < day.stops.length - 1; i++) L.push(routeLeg(day.stops[i], day.stops[i + 1]));
+    for (let i = 0; i < day.stops.length - 1; i++) L.push(legOf(day.stops[i], day.stops[i + 1]));
     legs.push(L);
     // walks at a stop (a stroll, or a path the stop brought along) are drawn as a dotted line in the day colour
     const walks = day.stops.map(s => { const w = walkOf(s); return w ? pathLine(w.path, false) : null; });
@@ -1504,7 +1536,7 @@ function updateOverlay(){
 // shuttle bus, the hire car, the Marado ferry, and walks at stops that carry a walking path (Marado, Ilchulbong).
 let play = null;
 const SEG_SEC = {walk: 11, air: 6, taxi: 2, minRoad: 1.6};          // playback seconds per segment
-const VIEW = {walk: {dist: 0.8, pol: 0.9}, bus: {dist: 2.2, pol: 0.95}, plane: {dist: 16, pol: 1.0}, taxi: {dist: 4, pol: 0.95}};
+const VIEW = {walk: {dist: 0.8, pol: 0.9}, bike: {dist: 1.2, pol: 0.92}, bus: {dist: 2.2, pol: 0.95}, plane: {dist: 16, pol: 1.0}, taxi: {dist: 4, pol: 0.95}};
 const altY = (x, z, altM) => Math.max(groundY(x, z), altM * 0.001 * state.exag);
 // lat/lon(/alt m) path -> polyline in scene units, densified every 20 m so it follows the terrain
 function pathLine(path, air){
@@ -1521,6 +1553,12 @@ function pathLine(path, air){
   const cum = [0];
   for (let i = 1; i < p.length; i++) cum.push(cum[i - 1] + Math.hypot(p[i].x - p[i - 1].x, p[i].z - p[i - 1].z));
   return {pts: p, cum, len: cum[cum.length - 1]};
+}
+// a flight between two stops: a straight track that climbs and comes down again, higher for a longer hop
+function flightArc(a, b){
+  const km = hav(a, b), top = clamp(km * 60, 200, 2500), n = Math.max(12, Math.ceil(km)), path = [];
+  for (let q = 0; q <= n; q++) { const f = q / n; path.push([a.lat + (b.lat - a.lat) * f, a.lon + (b.lon - a.lon) * f, top * Math.sin(Math.PI * f)]); }
+  return pathLine(path, true);
 }
 // the airport paths are the same every time: drape them once per terrain exaggeration
 const airCache = {};
@@ -1550,12 +1588,14 @@ function daySegments(d){
     const w = r && r.walks[i];
     if (w) add('walk', w, day + st[i].name + ' ' + walkOf(st[i]).label, i, i, SEG_SEC.walk);
     if (i < st.length - 1 && L[i] && r) {
-      const p = r.parts[i], by = st[i + 1].by;
-      const mode = L[i].kind === 'ferry' ? 'ferry' : by === 'bus' ? 'bus' : by === 'walk' && L[i].kind === 'road' ? 'walk' : 'car';
-      const line = {pts: r.pts.slice(p.from, p.to + 1), cum: r.cum.slice(p.from, p.to + 1).map(c => c - r.cum[p.from])};
+      const p = r.parts[i], by = st[i + 1].by, k = L[i].kind;
+      const mode = k === 'ferry' ? 'ferry' : k === 'air' ? 'plane' : k !== 'road' ? 'car' : by === 'bus' || by === 'walk' || by === 'bike' ? by : 'car';
+      let line = {pts: r.pts.slice(p.from, p.to + 1), cum: r.cum.slice(p.from, p.to + 1).map(c => c - r.cum[p.from])};
       line.len = line.cum[line.cum.length - 1];
-      add(mode, line, day + st[i].name + ' → ' + st[i + 1].name + ({bus: ' (버스)', ferry: ' (여객선)', walk: ' (걸어서)'}[mode] || ''), i, i + 1,
-          mode === 'walk' ? clamp(line.len * 9, 4, SEG_SEC.walk) : 0);
+      if (mode === 'plane') line = flightArc(st[i], st[i + 1]);     // the dashes stay on the ground, the plane flies above them
+      add(mode, line, day + st[i].name + ' → ' + st[i + 1].name + ({bus: ' (버스)', ferry: ' (여객선)', walk: ' (걸어서)', bike: ' (자전거)', plane: ' (비행기)'}[mode] || ''), i, i + 1,
+          mode === 'walk' ? clamp(line.len * 9, 4, SEG_SEC.walk) : mode === 'bike' ? clamp(line.len * 5, 3, 10) : mode === 'plane' ? clamp(2 + L[i].km * 0.08, 3, SEG_SEC.air) : 0,
+          mode === 'plane' ? {dist: clamp(L[i].km * 0.9, 3, 16), pol: 1.0} : null);
     }
   }
   const li = st.length - 1;
@@ -1731,6 +1771,7 @@ function placeMover(seg, s, moving){
     const sw = moving ? Math.sin(play.anim * 11) * 0.55 : 0, l = MODELS.walk.userData.limbs;
     l[0].rotation.x = sw; l[1].rotation.x = -sw; l[2].rotation.x = -sw * 0.8; l[3].rotation.x = sw * 0.8;
   }
+  if (mode === 'bike') MODELS.bike.userData.pedal(moving ? play.anim * 9 : 0.6);
   const c = dayColor(seg.d);
   paint.color.set(c); paint.emissive.set(c);
   goal.tx = mover.position.x; goal.tz = mover.position.z;
@@ -1862,26 +1903,43 @@ const timeText = s => s.time + (s.dep && s.dep !== s.time ? '–' + s.dep : '');
 
 /* ---- how each leg is travelled ---- */
 const MODES = [{id: 'car', label: '자동차', icon: IC.car}, {id: 'coast', label: '해안도로', icon: IC.coast},
-               {id: 'bus', label: '버스', icon: IC.bus}, {id: 'walk', label: '도보', icon: IC.walk}];
-const modeOf = s => s.by === 'bus' ? 'bus' : s.by === 'walk' ? 'walk' : s.coast ? 'coast' : 'car';
-function setMode(s, m){ s.by = m === 'bus' || m === 'walk' ? m : ''; s.coast = m === 'coast'; }
-// minutes by mode: driving time comes from the road graph; buses stop and wait; walkers do about 4.5 km/h
+               {id: 'bus', label: '버스', icon: IC.bus}, {id: 'bike', label: '자전거', icon: IC.bike}, {id: 'walk', label: '도보', icon: IC.walk},
+               {id: 'ferry', label: '배', icon: IC.ferry}, {id: 'plane', label: '비행기', icon: IC.plane}];
+const modeOf = s => BY.includes(s.by) ? s.by : s.coast ? 'coast' : 'car';
+// on the roads (directions apps, the way from the phone) a boat or plane leg counts as a drive
+const roadMode = s => { const m = modeOf(s); return m === 'ferry' || m === 'plane' ? 'car' : m; };
+function setMode(s, m){ s.by = BY.includes(m) ? m : ''; s.coast = m === 'coast'; }
+// minutes by mode: driving time comes from the road graph; buses stop and wait; bikes do about 15 km/h, walkers 4.5 km/h
 function legMin(l, b){
   if (l.kind !== 'road') return null;
-  const m = modeOf(b);
-  return m === 'walk' ? l.km / 4.5 * 60 : m === 'bus' ? l.min * 1.4 + 5 : l.min;
+  const m = roadMode(b);
+  return m === 'walk' ? l.km / 4.5 * 60 : m === 'bike' ? l.km / 15 * 60 : m === 'bus' ? l.min * 1.4 + 5 : l.min;
 }
+// off the roads: a boat at about 25 km/h plus boarding, a plane at about 300 km/h plus boarding, a straight hop at 30 km/h
+const crossMin = l => l.kind === 'ferry' ? l.km / 25 * 60 + 10 : l.kind === 'air' ? l.km / 300 * 60 + 30 : l.km / 30 * 60;
 function legText(l, a, b){
-  if (l.kind === 'ferry') {
-    let t = '배편 ' + fmtKm(l.km);
+  if (l.kind === 'ferry' || l.kind === 'air') {
+    let t = (l.kind === 'air' ? '비행기 ' : '배편 ') + fmtKm(l.km);
     if (a.dep && b.time && toMin(b.time) > toMin(a.dep)) t += ' · ' + a.dep + ' 출발 → ' + b.time + ' 도착';
     else if (a.dep) t += ' · ' + a.dep + ' 출발';
+    else t += ' · 약 ' + fmtMin(crossMin(l));
     return t;
   }
   if (l.kind === 'direct') return '직선 ' + fmtKm(l.km) + ' · 도로로 이어지지 않음';
-  return MODES.find(x => x.id === modeOf(b)).label + ' ' + fmtKm(l.km) + ' · 약 ' + fmtMin(legMin(l, b));
+  return MODES.find(x => x.id === roadMode(b)).label + ' ' + fmtKm(l.km) + ' · 약 ' + fmtMin(legMin(l, b));
 }
-const legIcon = (l, b) => l.kind === 'ferry' ? IC.ferry : l.kind === 'direct' ? IC.line : MODES.find(x => x.id === modeOf(b)).icon;
+const legIcon = (l, b) => l.kind === 'ferry' ? IC.ferry : l.kind === 'air' ? IC.plane : l.kind === 'direct' ? IC.line : MODES.find(x => x.id === roadMode(b)).icon;
+// The ways a leg can be travelled, as a row of buttons. The road modes need a road between the two stops; a boat
+// or a plane can always be picked. after(mode) runs once the choice is stored on b.
+function modePicker(a, b, after, label){
+  const base = routeLeg(a, b), road = base.kind === 'road';
+  const cur = road || b.by === 'ferry' || b.by === 'plane' ? modeOf(b) : base.kind === 'ferry' ? 'ferry' : '';
+  return h('div', {class: 'leg-pick', role: 'radiogroup', 'aria-label': label},
+    (road ? MODES : MODES.filter(m => m.id === 'ferry' || m.id === 'plane')).map(m => h('button', {class: 'seg', type: 'button', role: 'radio',
+      'aria-checked': String(cur === m.id), html: m.icon + '<span>' + m.label + '</span>', onclick: () => { setMode(b, m.id); after(m.id); }})),
+    h('p', {class: 'leg-hint'}, road ? '동선 재생에서 고른 수단으로 움직입니다. 시간은 추정값입니다. 버스는 정류장과 기다림을 더하고, 자전거는 시속 15km, 도보는 시속 4.5km로 잡습니다. 배와 비행기는 두 장소를 곧게 잇습니다.'
+      : '두 장소가 도로로 이어지지 않아 배나 비행기로만 고를 수 있습니다.'));
+}
 function dayTotal(d){
   const L = legs[d] || [], st = trip.days[d].stops;
   if (!L.length) return '';
@@ -2223,7 +2281,7 @@ function openStop(d, i){
   if (!s) return;
   state.sel = {d, i}; applyFilter();
   openView('stop', v => {
-    const L = legs[d] || [], ferryNext = L[i] && L[i].kind === 'ferry';
+    const L = legs[d] || [], crossNext = L[i] && (L[i].kind === 'ferry' || L[i].kind === 'air') ? L[i].kind : '';
     const upd = (k, max) => e => { const val = e.target.value.trim().slice(0, max); if (k !== 'name' || val) s[k] = val; commit(true); };
     const move = to => { day.stops.splice(to, 0, day.stops.splice(i, 1)[0]); state.sel = {d, i: to}; commit(); openStop(d, to); };
     const toDay = h('select', {class: 'in', id: fid(), onchange: e => {
@@ -2235,10 +2293,15 @@ function openStop(d, i){
     const etaP = h('p', {class: 'hint', style: 'margin:-8px 0 16px', 'aria-live': 'polite'});
     const etaText = () => {
       const p = dayPlan(d)[i];
-      etaP.textContent = !p ? '' : i === 0 ? '이 날 첫 장소입니다. ' + (s.time ? s.time + '부터' : '시간이 없으면 9시부터') + ' 다음 장소들의 도착 시각을 계산합니다.'
+      etaP.textContent = !p ? '' : i === 0 ? '이 날 첫 장소입니다. ' + (s.time ? s.time + '부터 다음 장소들의 도착 시각을 계산합니다.'
+          : '시간이 없으면, 시간을 넣은 첫 장소에 맞춰 여기서 출발하는 것으로 계산합니다(시간을 넣은 장소가 없으면 9시부터).')
         : '예상 도착 ~' + clock(p.eta) + ' (앞 장소에서 머무는 시간과 이동 시간으로 계산)' + (p.late > 10 ? ' · 넣은 시간보다 약 ' + fmtMin(p.late) + ' 늦을 것 같습니다.' : '');
       etaP.classList.toggle('warn', !!p && p.late > 10);
     };
+    // the way here from the stop before (and the vehicle the playback shows): redrawn in place when changed
+    let modeBox = null;
+    const pickMode = () => { const p = modePicker(day.stops[i - 1], s, () => { commit(true); const n = pickMode(); modeBox.replaceWith(n); modeBox = n; etaText(); }, '앞 장소에서 여기까지 이동수단'); p.style.setProperty('--c', dayColor(d)); return p; };
+    if (i > 0) modeBox = pickMode();
     const STAYS = [15, 30, 45, 60, 90, 120, 150, 180, 240, 300, 360, 480];
     const stay = h('select', {class: 'in', id: fid(), onchange: e => { s.stay = e.target.value === '' ? null : +e.target.value; commit(true); etaText(); }},
       h('option', {value: '', selected: s.stay == null}, '기본 ' + fmtMin(defaultStay(s))),
@@ -2250,9 +2313,11 @@ function openStop(d, i){
         field('도착 시간', h('input', {class: 'in', id: fid(), type: 'time', value: s.time, onchange: e => { upd('time', 5)(e); etaText(); }})),
         field('머무는 시간', stay)),
       etaP,
-      ferryNext ? field('배 출발 시각', h('input', {class: 'in', id: fid(), type: 'time', value: s.dep || '', style: 'max-width:50%', onchange: e => { upd('dep', 5)(e); etaText(); }}),
-        '다음 장소까지 바다를 건너 배편으로 계산했습니다. 출발 시각을 넣으면 구간에 시간표가 나옵니다.') : null,
+      crossNext ? field(crossNext === 'air' ? '비행기 출발 시각' : '배 출발 시각', h('input', {class: 'in', id: fid(), type: 'time', value: s.dep || '', style: 'max-width:50%', onchange: e => { upd('dep', 5)(e); etaText(); }}),
+        (crossNext === 'air' ? '다음 장소까지 비행기로 갑니다.' : '다음 장소까지 바다를 건너 배편으로 계산했습니다.') + ' 출발 시각을 넣으면 구간에 시간표가 나옵니다.') : null,
       field('메모', h('textarea', {class: 'in', id: fid(), maxLength: 200, placeholder: '예: 점심, 예약 12시, 입장료 확인', onchange: upd('memo', 200)}, s.memo)),
+      i > 0 ? h('h3', {class: 'group-h'}, '여기까지 오는 방법') : null,
+      i > 0 ? modeBox : null,
       h('label', {class: 'switch'}, h('span', null, h('b', null, '걸어서 둘러보기'), h('span', {class: 'hint'}, '이 장소 주변 산책로를 걷는 동선을 지도와 재생에 넣습니다.')),
         h('input', {type: 'checkbox', checked: !!s.stroll, onchange: e => {
           s.stroll = e.target.checked; commit(true);
@@ -2571,21 +2636,16 @@ function legRow(d, i, l, a, b){
     'aria-label': (i + 1) + '번에서 ' + (i + 2) + '번까지 ' + legText(l, a, b) + ', 이동수단 바꾸기',
     onclick: () => { legOpen = open ? null : key; renderPanel(); }}));
   if (!open) return wrap;
-  if (l.kind === 'ferry') {
-    const id = fid();
-    wrap.append(h('div', {class: 'leg-pick'}, h('label', {class: 'hint', for: id, style: 'align-self:center'}, '배 출발 시각'),
+  wrap.append(modePicker(a, b, () => { legOpen = null; commit(); }, (i + 1) + '번에서 ' + (i + 2) + '번까지 이동수단'));
+  if (l.kind === 'ferry' || l.kind === 'air') {
+    const id = fid(), air = l.kind === 'air';
+    wrap.append(h('div', {class: 'leg-pick'}, h('label', {class: 'hint', for: id, style: 'align-self:center'}, air ? '비행기 출발 시각' : '배 출발 시각'),
       h('input', {class: 'in', id, type: 'time', value: a.dep || '', style: 'max-width:160px', onchange: e => { a.dep = e.target.value; legOpen = null; commit(); }}),
-      h('p', {class: 'leg-hint'}, '바다를 건너는 구간이라 배편으로 계산했습니다. 출발 시각을 넣으면 도착 시간과 함께 보여 줍니다.')));
+      h('p', {class: 'leg-hint'}, (air ? '비행기로 곧게 날아가는 것으로 그렸습니다.' : b.by === 'ferry' ? '배로 곧게 건너는 것으로 그렸습니다.' : '바다를 건너는 구간이라 배편으로 계산했습니다.')
+        + ' 출발 시각을 넣으면 도착 시간과 함께 보여 줍니다.')));
   } else if (l.kind === 'direct') {
     wrap.append(h('p', {class: 'leg-hint', style: 'padding:4px 0 8px'}, '두 장소가 지도의 도로로 이어지지 않아 직선으로 그렸습니다. 위치를 큰길 가까이로 옮기면 도로 경로로 바뀝니다.'));
-  } else {
-    const cur = modeOf(b);
-    wrap.append(h('div', {class: 'leg-pick', role: 'radiogroup', 'aria-label': (i + 1) + '번에서 ' + (i + 2) + '번까지 이동수단'},
-      MODES.map(m => h('button', {class: 'seg', type: 'button', role: 'radio', 'aria-checked': String(cur === m.id), html: m.icon + '<span>' + m.label + '</span>',
-        onclick: () => { setMode(b, m.id); legOpen = null; commit(); }})),
-      h('p', {class: 'leg-hint'}, '시간은 도로망으로 낸 추정값입니다. 버스는 정류장과 기다림을 더해 길게, 도보는 시속 4.5km로 잡습니다.')),
-      h('button', {class: 'btn sm leg-nav', type: 'button', html: IC.nav + '<span>이 구간 길안내 (카카오맵·네이버지도)</span>', onclick: () => openNav(a, b, modeOf(b))}));
-  }
+  } else wrap.append(h('button', {class: 'btn sm leg-nav', type: 'button', html: IC.nav + '<span>이 구간 길안내 <span class="nw">(카카오맵·네이버지도)</span></span>', onclick: () => openNav(a, b, modeOf(b))}));
   return wrap;
 }
 function daySection(d){
@@ -2727,14 +2787,21 @@ function defaultStay(s){                  // minutes, by the kind of place found
 }
 const stayOf = s => s.stay != null ? s.stay : defaultStay(s);
 function dayPlan(d){
+  const st = trip.days[d] ? trip.days[d].stops : [];
+  // a day that starts at a stop without a time (the hotel, say) leaves it in time for the first stop that has one,
+  // so an early start (a sunrise, a morning boat) is not flagged late; with no times at all the day starts at 9:00
+  const k = st.length && !st[0].time ? st.findIndex(s => s.time) : -1;
+  return planFrom(d, k > 0 ? clamp(toMin(st[k].time) - planFrom(d, 0)[k].eta, 0, 1439) : 540);
+}
+function planFrom(d, start){
   const st = trip.days[d] ? trip.days[d].stops : [], L = legs[d] || [], out = [];
   let t = 0;
   st.forEach((s, i) => {
-    let eta = s.time ? toMin(s.time) : 540;
+    let eta = s.time ? toMin(s.time) : start;
     if (i > 0) {
       const l = L[i - 1];
       let m = l ? legMin(l, s) : 0;
-      if (m == null) m = l.kind === 'ferry' ? l.km / 25 * 60 + 10 : l.km / 30 * 60;   // a crossing: about 25 km/h and boarding
+      if (m == null) m = crossMin(l);
       eta = t + m;
     }
     const plan = s.time ? toMin(s.time) : null, late = plan != null && i > 0 ? Math.round(eta - plan) : 0;
@@ -2811,7 +2878,7 @@ function nextText(d, k){
     const l = r.leg, m = legMin(l, s), parts = ['여기서 ' + fmtKm(l.kind === 'road' ? l.km : hav(me.fix, s))];
     if (m != null) {
       const arr = nowMin() + m;
-      parts.push(MODES.find(x => x.id === modeOf(s)).label + ' 약 ' + fmtMin(m), clock(arr) + '쯤 도착');
+      parts.push(MODES.find(x => x.id === roadMode(s)).label + ' 약 ' + fmtMin(m), clock(arr) + '쯤 도착');
       if (s.time) { const late = Math.round(arr - toMin(s.time)); if (late > 10) parts.push('예정보다 ' + fmtMin(late) + ' 늦음'); else if (late < -10) parts.push('예정보다 ' + fmtMin(-late) + ' 일찍'); }
     } else parts.push(l.kind === 'ferry' ? '배로 건너는 곳' : '도로로 이어지지 않음');
     return parts.join(' · ');
@@ -2919,13 +2986,13 @@ const UA = navigator.userAgent, IS_ANDROID = /Android/i.test(UA), IS_IOS = /iPho
 const navNm = s => String(s.name || '목적지').replace(/[,/\\#?%]+/g, ' ').trim().slice(0, 40) || '목적지';
 const kakaoPt = s => encodeURIComponent(navNm(s)) + ',' + (+s.lat).toFixed(6) + ',' + (+s.lon).toFixed(6);
 function kakaoUrl(a, b, mode){
-  return a ? 'https://map.kakao.com/link/by/' + ({bus: 'traffic', walk: 'walk'}[mode] || 'car') + '/' + kakaoPt(a) + '/' + kakaoPt(b)
+  return a ? 'https://map.kakao.com/link/by/' + ({bus: 'traffic', walk: 'walk', bike: 'bicycle'}[mode] || 'car') + '/' + kakaoPt(a) + '/' + kakaoPt(b)
     : 'https://map.kakao.com/link/to/' + kakaoPt(b);
 }
 function naverPath(a, b, mode){
   const q = a ? {slat: (+a.lat).toFixed(6), slng: (+a.lon).toFixed(6), sname: navNm(a)} : {};
   Object.assign(q, {dlat: (+b.lat).toFixed(6), dlng: (+b.lon).toFixed(6), dname: navNm(b), appname: location.origin + location.pathname});
-  return 'route/' + ({bus: 'public', walk: 'walk'}[mode] || 'car') + '?' + Object.keys(q).map(k => k + '=' + encodeURIComponent(q[k])).join('&');
+  return 'route/' + ({bus: 'public', walk: 'walk', bike: 'bicycle'}[mode] || 'car') + '?' + Object.keys(q).map(k => k + '=' + encodeURIComponent(q[k])).join('&');
 }
 function naverOpen(a, b, mode){
   const path = naverPath(a, b, mode);
@@ -2938,7 +3005,8 @@ function naverOpen(a, b, mode){
 }
 // a = null: from wherever the phone is (the map app finds it)
 function openNav(a, b, mode){
-  ask('어느 지도로 길안내를 열까요?', (a ? a.name : '내 위치') + ' → ' + b.name + ({bus: ' (대중교통)', walk: ' (도보)'}[mode] || ' (자동차)'),
+  if (mode === 'ferry' || mode === 'plane') mode = 'car';        // map apps route roads only
+  ask('어느 지도로 길안내를 열까요?', (a ? a.name : '내 위치') + ' → ' + b.name + ({bus: ' (대중교통)', walk: ' (도보)', bike: ' (자전거)'}[mode] || ' (자동차)'),
     '카카오맵', () => window.open(kakaoUrl(a, b, mode), '_blank', 'noopener'), {label: '네이버지도', fn: () => naverOpen(a, b, mode)});
 }
 
