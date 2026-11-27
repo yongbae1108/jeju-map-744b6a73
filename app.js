@@ -3552,6 +3552,6 @@ window.__jeju = {cam, goal, state, mover, get mode(){ return moverMode; }, get p
   packTrip, unpackTrip, linkCode, receiveLink, makeLink, shareTrip, openPaste, restoreBefore,
   async addPhoto(d, i, blob){ const r = await addPhotos(trip.days[d].stops[i], [blob]); if (!play) rebuildScene(); return r; }, photosOf: (d, i) => photosOf(trip.days[d].stops[i]).length,
   openViewer, get viewer(){ return vw && {k: vw.k, sid: vw.sid}; }, strayPhotos, get photoFailed(){ return PH.failed; },
-  async loadExample(){ replaceTrip(sanitizeTrip(await (await fetch('data/example_trip.json')).json())); },
+  async loadExample(src){ replaceTrip(sanitizeTrip(src || await (await fetch('data/example_trip.json')).json())); },   // src: a test's own trip
   get osm(){ return {tilesBuilt: B ? B.built : 0, buildings: B ? B.x.length : 0, graphNodes: G ? G.n : 0, peekPx, inset}; }};
 }
