@@ -58,7 +58,7 @@ const ptList = (a, n) => Array.isArray(a) ? a.filter(p => Array.isArray(p) && p.
 const airOf = o => o && ptList(o.path, 3).length > 1 ? {path: ptList(o.path, 3), taxi: ptList(o.taxi, 2)} : null;
 // Saved trips outlive app updates: every stored trip carries the schema version it was written with, older versions are
 // migrated step by step here, and fields this version does not know are kept so an update never drops them.
-const APP_VERSION = '2026.11.27-3', SCHEMA = 2;
+const APP_VERSION = '2026.11.27-4', SCHEMA = 2;
 let bootSec = '', dataSec = '';
 const MIGRATE = {
   1: o => { o.air = o.air !== false; return o; }      // v1 (before 2026-11-27): no airport flights yet -> on by default
@@ -1893,9 +1893,24 @@ function measurePeek(){
   peekPx = Math.round(clamp(pk.offsetTop + pk.offsetHeight + 6 + $('dock').offsetHeight, 200, innerHeight * 0.5));
 }
 function mapInset(){ return isDesk() ? 0 : snap === 'mini' ? miniPx() : peekPx; }
-let sdrag = null;
+// Dragging the sheet. With a finger the whole sheet takes part: until it is fully open, any up-or-down drag on it
+// moves the sheet (sideways drags still scroll the day chips); fully open, the list scrolls, and pulling down from the
+// top of the list folds the sheet again. Mouse and pen drag by the grip, the day head and the mosaic band.
+// Taps on the grip or the band come in as clicks (so the keyboard works too); a drag swallows the click that follows.
+let sdrag = null, dragEnded = 0;
+const sheetMax = () => sheet.offsetHeight - miniPx();
+function settleSheet(cur, v){        // nearest snap, or the next one in the direction of a fling
+  sheet.classList.remove('dragging');
+  dragEnded = performance.now();
+  const order = ['full', 'half', 'peek', 'mini'], ys = order.map(snapY);
+  let k = 0;
+  ys.forEach((y, i) => { if (Math.abs(y - cur) < Math.abs(ys[k] - cur)) k = i; });
+  if (v < -0.45) { const up = ys.map((y, i) => y < cur - 10 ? i : -1).filter(i => i >= 0); k = up.length ? up[up.length - 1] : 0; }
+  else if (v > 0.45) { const i = ys.findIndex(y => y > cur + 10); k = i < 0 ? order.length - 1 : i; }
+  setSnap(view && (order[k] === 'peek' || order[k] === 'mini') ? 'half' : order[k]);
+}
 function sheetDown(e){
-  if (isDesk() || e.button > 0 || e.target.closest('input,textarea,select')) return;
+  if (isDesk() || e.pointerType === 'touch' || e.button > 0 || e.target.closest('input,textarea,select')) return;
   sdrag = {y0: e.clientY, sy0: snapY(snap), y: e.clientY, t: performance.now(), v: 0, moved: false, id: e.pointerId, el: e.currentTarget};
 }
 function sheetMove(e){
@@ -1906,31 +1921,60 @@ function sheetMove(e){
     sdrag.moved = true; sheet.classList.add('dragging');
     try { sdrag.el.setPointerCapture(e.pointerId); } catch (err) {}
   }
-  sheet.style.setProperty('--sy', clamp(sdrag.sy0 + dy, 0, sheet.offsetHeight - miniPx()) + 'px');
+  sheet.style.setProperty('--sy', clamp(sdrag.sy0 + dy, 0, sheetMax()) + 'px');
   const now = performance.now();
   sdrag.v = (e.clientY - sdrag.y) / Math.max(1, now - sdrag.t); sdrag.y = e.clientY; sdrag.t = now;
 }
 function sheetUp(e){
   if (!sdrag || e.pointerId !== sdrag.id) return;
   const d = sdrag; sdrag = null;
-  if (!d.moved) { if (d.el !== $('dayhead') && e.type === 'pointerup') gripTap(); return; }
-  sheet.classList.remove('dragging');
-  const cur = d.sy0 + e.clientY - d.y0, order = ['full', 'half', 'peek', 'mini'], ys = order.map(snapY);
-  let k = 0;      // ys grow from full to peek; a fling goes to the next stop in its direction, otherwise the nearest
-  ys.forEach((y, i) => { if (Math.abs(y - cur) < Math.abs(ys[k] - cur)) k = i; });
-  if (d.v < -0.45) { const up = ys.map((y, i) => y < cur - 10 ? i : -1).filter(i => i >= 0); k = up.length ? up[up.length - 1] : 0; }
-  else if (d.v > 0.45) { const i = ys.findIndex(y => y > cur + 10); k = i < 0 ? order.length - 1 : i; }
-  setSnap(view && (order[k] === 'peek' || order[k] === 'mini') ? 'half' : order[k]);
+  if (d.moved) settleSheet(d.sy0 + e.clientY - d.y0, d.v);
 }
 // a tap on the grip steps open (mini -> peek -> half) and closes back to peek from above
-const gripTap = () => setSnap(snap === 'mini' ? 'peek' : snap === 'peek' ? 'half' : view ? 'half' : 'peek');
+const gripTap = () => { if (performance.now() - dragEnded > 350) setSnap(snap === 'mini' ? 'peek' : snap === 'peek' ? 'half' : view ? 'half' : 'peek'); };
 for (const el of [$('grip'), $('dayhead'), sheet.querySelector('.mosaic')]) {
   el.addEventListener('pointerdown', sheetDown);
   el.addEventListener('pointermove', sheetMove);
   el.addEventListener('pointerup', sheetUp);
   el.addEventListener('pointercancel', sheetUp);
 }
-$('grip').addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); gripTap(); } });
+$('grip').addEventListener('click', gripTap);
+sheet.querySelector('.mosaic').addEventListener('click', gripTap);
+let tdrag = null;
+sheet.addEventListener('touchstart', e => {
+  if (isDesk() || state.pick || e.touches.length !== 1 || e.target.closest('input,textarea,select,.handle')) { tdrag = null; return; }
+  const t = e.touches[0];
+  tdrag = {id: t.identifier, x0: t.clientX, y0: t.clientY, y: t.clientY, t: performance.now(), v: 0, mode: '', moved: false, sy0: snapY(snap)};
+}, {passive: true});
+sheet.addEventListener('touchmove', e => {
+  if (!tdrag) return;
+  const t = [...e.changedTouches].find(x => x.identifier === tdrag.id);
+  if (!t) return;
+  const dx = t.clientX - tdrag.x0, dy = t.clientY - tdrag.y0;
+  if (!tdrag.mode) {
+    if (Math.abs(dx) < 2 && Math.abs(dy) < 2) return;
+    tdrag.mode = Math.abs(dx) > Math.abs(dy) ? 'x'                                   // sideways: chips scroll natively
+      : snap !== 'full' || (dy > 0 && scroller.scrollTop <= 0) ? 'sheet' : 'scroll';  // fully open: the list scrolls
+  }
+  if (tdrag.mode !== 'sheet') return;
+  if (e.cancelable) e.preventDefault();
+  if (!tdrag.moved) {
+    if (Math.abs(dy) < 6) return;
+    tdrag.moved = true; sheet.classList.add('dragging');
+  }
+  sheet.style.setProperty('--sy', clamp(tdrag.sy0 + dy, 0, sheetMax()) + 'px');
+  const now = performance.now();
+  tdrag.v = (t.clientY - tdrag.y) / Math.max(1, now - tdrag.t); tdrag.y = t.clientY; tdrag.t = now;
+}, {passive: false});
+const touchEnd = e => {
+  if (!tdrag) return;
+  const t = [...e.changedTouches].find(x => x.identifier === tdrag.id);
+  if (!t) return;
+  const d = tdrag; tdrag = null;
+  if (d.mode === 'sheet' && d.moved) settleSheet(d.sy0 + t.clientY - d.y0, d.v);
+};
+sheet.addEventListener('touchend', touchEnd);
+sheet.addEventListener('touchcancel', touchEnd);
 
 /* ---- sub views inside the sheet: search, stop, day, trip ---- */
 // build(v) may return an element to focus; focusing happens after the view is shown, still inside the tap,
