@@ -58,7 +58,7 @@ const ptList = (a, n) => Array.isArray(a) ? a.filter(p => Array.isArray(p) && p.
 const airOf = o => o && ptList(o.path, 3).length > 1 ? {path: ptList(o.path, 3), taxi: ptList(o.taxi, 2)} : null;
 // Saved trips outlive app updates: every stored trip carries the schema version it was written with, older versions are
 // migrated step by step here, and fields this version does not know are kept so an update never drops them.
-const APP_VERSION = '2026.11.27-10', SCHEMA = 2;
+const APP_VERSION = '2026.11.27-11', SCHEMA = 2;
 let bootSec = '', dataSec = '';
 const MIGRATE = {
   1: o => { o.air = o.air !== false; return o; }      // v1 (before 2026-11-27): no airport flights yet -> on by default
@@ -129,6 +129,10 @@ let trip = loadTrip();
 if (idsAdded && !rescued && store.get(TRIP_KEY)) store.set(TRIP_KEY, JSON.stringify(trip));
 // ask the browser not to evict our storage under pressure (granted for installed web apps on Android; harmless elsewhere)
 try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {}); } catch (e) {}
+// devices sharing this trip (동기화, set up further down): declared here so that every save can reach it
+const SYNC_KEY = 'jejumap.sync';
+const sync = {cfg: null, ck: null, es: null, latest: null, state: 'ok', q: Promise.resolve(), gen: 0, retry: 0, hiddenAt: 0,
+  sending: false, applying: false, making: false, waitEcho: null, pushT: 0, settleT: 0, echoT: 0, mine: null, tried: null};
 
 const state = {
   day: trip.days.length > 1 ? -1 : 0, sel: null, pick: null, today: false, todayDay: -1,
@@ -2128,6 +2132,7 @@ const inBox = (lat, lon) => lat >= T.lat1 && lat <= T.lat0 && lon >= T.lon0 && l
 /* ---- saving ---- */
 function commit(keepPanel){
   if (!store.set(TRIP_KEY, JSON.stringify(trip))) toast('이 브라우저에 일정을 저장하지 못했습니다. 개인정보 보호 모드인지 확인해 주세요.');
+  syncLocal();
   if (state.sel && !(trip.days[state.sel.d] && trip.days[state.sel.d].stops[state.sel.i])) state.sel = null;
   if (state.day >= trip.days.length) state.day = trip.days.length - 1;
   if (play) stopPlay();
@@ -2270,12 +2275,17 @@ addEventListener('popstate', () => {
 // Focus starts on 취소, Tab stays inside, Esc / back / a tap outside cancel. It takes the history entry only when
 // nothing else holds one, so closing it never closes the view underneath.
 // alt = {label, fn}: a second choice (the dialog then stacks its buttons: yes, alt, 취소)
+// o = {kick, more, no}: a small line above the title, more content under the text, and the cancel button's label
 let askCb = null, askAlt = null, askNav = false, askReturn = null;
-function ask(title, body, yes, cb, alt){
+function ask(title, body, yes, cb, alt, o){
+  o = o || {};
   askReturn = document.activeElement;
   $('askTitle').textContent = title; $('askBody').textContent = body; $('askYes').textContent = yes;
   $('askAlt').hidden = !alt; $('askAlt').textContent = alt ? alt.label : '';
-  $('ask').classList.toggle('stack', !!alt);
+  $('askKick').hidden = !o.kick; $('askKick').textContent = o.kick || '';
+  $('askMore').hidden = !o.more; $('askMore').replaceChildren(...(o.more ? [o.more] : []));
+  $('askNo').textContent = o.no || '취소';
+  $('ask').classList.toggle('stack', !!alt); $('ask').classList.toggle('news', !!o.more);
   askCb = cb; askAlt = alt ? alt.fn : null; askNav = !navArmed; navOpen();
   $('ask').hidden = false; $('askNo').focus();
 }
@@ -2539,7 +2549,7 @@ function replaceTrip(t, msg){
 }
 const keepWarning = () => {
   const n = trip.days.reduce((s, x) => s + x.stops.length, 0);
-  return !n || confirm('지금 일정(장소 ' + n + '곳)은 지워집니다. 남겨 두려면 먼저 ‘일정 파일 내보내기’를 하세요. 계속할까요?');
+  return !n || confirm('지금 일정(장소 ' + n + '곳)은 지워집니다.' + (sync.cfg ? ' 동기화로 연결된 다른 기기의 일정도 함께 바뀝니다.' : '') + ' 남겨 두려면 먼저 ‘일정 파일 내보내기’를 하세요. 계속할까요?');
 };
 async function loadExample(){
   if (!keepWarning()) return;
@@ -2603,15 +2613,17 @@ function openTrip(){
       h('label', {class: 'switch', style: 'margin-bottom:16px'}, h('span', null, h('b', null, '비행기로 오가기'),
           h('span', {class: 'hint'}, '첫 장소 앞에 제주공항 도착을, 마지막 장소 뒤에 제주공항 출발을 넣습니다. 동선 재생은 비행기로 시작하고 끝납니다.')),
         h('input', {type: 'checkbox', checked: trip.air, onchange: e => { trip.air = e.target.checked; commit(true); }})),
+      h('h3', {class: 'group-h'}, '기기 간 동기화'), syncBox(),
       h('h3', {class: 'group-h'}, '일정 보내기·받기'),
       h('div', {class: 'group'},
-        h('button', {class: 'btn primary', type: 'button', html: IC.link + '<span>링크로 일정 보내기</span>', onclick: shareTrip}),
+        h('button', {class: sync.cfg ? 'btn' : 'btn primary', type: 'button', html: IC.link + '<span>링크로 일정 보내기</span>', onclick: shareTrip}),
         h('button', {class: 'btn', type: 'button', html: IC.open + '<span>받은 링크로 일정 열기</span>', onclick: openPaste}),
         h('p', {class: 'hint'}, '링크 하나에 일정이 모두 담겨, 카카오톡으로 보내면 받은 사람이 눌러서 바로 엽니다. 일정은 링크 안에만 들어 있고 어느 서버에도 올라가지 않습니다. 사진과 도착 체크는 보내지 않습니다.'),
         store.get(BEFORE_KEY) ? h('button', {class: 'btn', type: 'button', onclick: restoreBefore}, '링크 받기 전 일정 다시 열기') : null,
         h('button', {class: 'btn', type: 'button', html: IC.share + '<span>일정 파일 내보내기·공유</span>', onclick: exportTrip}),
         h('button', {class: 'btn', type: 'button', html: IC.open + '<span>일정 파일 가져오기</span>', onclick: importTrip}),
-        h('p', {class: 'hint'}, '일정은 이 기기의 브라우저에만 저장되고, 앱이 새 버전으로 바뀌어도 그대로 남습니다.')),
+        h('p', {class: 'hint'}, sync.cfg ? '일정은 이 기기에 저장되고 동기화로 연결된 기기와 맞춰지며, 앱이 새 버전으로 바뀌어도 그대로 남습니다.'
+          : '일정은 이 기기의 브라우저에만 저장되고, 앱이 새 버전으로 바뀌어도 그대로 남습니다.')),
       h('h3', {class: 'group-h'}, '사진'),
       photoStats(),
       h('h3', {class: 'group-h'}, '새로 시작'),
@@ -2625,7 +2637,8 @@ function openTrip(){
         h('p', {class: 'hint'}, '경로와 이동 시간은 지도에 담긴 도로망으로 계산한 추정값입니다. 일방통행과 실시간 교통은 반영하지 않습니다.')),
       h('p', {class: 'credit'}, '지형 Mapzen Terrain Tiles (SRTM·GMTED2010·ETOPO1 등) · 도로·건물·숲·장소 © OpenStreetMap contributors (ODbL) · 주소 검색 Esri ArcGIS',
         h('br'), '앱 버전 ' + APP_VERSION + (META && META.built ? ' · 자료 ' + META.built : '') +
-          (bootSec ? ' · 이번 시작 ' + bootSec + '초(자료 ' + dataSec + '초)' : '')));
+          (bootSec ? ' · 이번 시작 ' + bootSec + '초(자료 ' + dataSec + '초) ' : ' '),
+        h('button', {class: 'link', type: 'button', onclick: () => showNews()}, '새 기능 안내 다시 보기')));
   });
 }
 
@@ -2960,7 +2973,7 @@ function planFrom(d, start){
   return out;
 }
 const dayEnd = d => { const st = trip.days[d] ? trip.days[d].stops : []; if (st.length < 2) return ''; const p = dayPlan(d); return '마지막 도착 ~' + clock(p[p.length - 1].arr); };
-function saveTrip(){ if (!store.set(TRIP_KEY, JSON.stringify(trip))) toast('이 브라우저에 일정을 저장하지 못했습니다. 개인정보 보호 모드인지 확인해 주세요.'); }
+function saveTrip(){ if (!store.set(TRIP_KEY, JSON.stringify(trip))) toast('이 브라우저에 일정을 저장하지 못했습니다. 개인정보 보호 모드인지 확인해 주세요.'); syncLocal(); }
 const countStops = t => t.days.reduce((a, x) => a + x.stops.length, 0);
 
 /* ================= today: the day of the trip that is today ================= */
@@ -3344,12 +3357,14 @@ async function receiveLink(code, src){
     else toast('받은 일정 ‘' + t.title + '’' + josa(t.title, '을', '를') + ' 열었습니다.', mine ? '되돌리기' : null, mine ? () => replaceTrip(old, '전에 쓰던 일정으로 되돌렸습니다.') : null, 8000);
   };
   if (!mine) return open();
-  ask('받은 일정을 열까요?', '‘' + t.title + '’ · ' + t.days.length + '일 · 장소 ' + n + '곳. 지금 일정(장소 ' + mine + '곳)은 이 기기에 보관해 두고, 여행 정보에서 다시 열 수 있습니다.', '열기', open);
+  ask('받은 일정을 열까요?', '‘' + t.title + '’ · ' + t.days.length + '일 · 장소 ' + n + '곳. 지금 일정(장소 ' + mine + '곳)은 이 기기에 보관해 두고, 여행 정보에서 다시 열 수 있습니다.' +
+    (sync.cfg ? ' 동기화로 연결된 다른 기기의 일정도 받은 일정으로 바뀝니다.' : ''), '열기', open);
 }
-function restoreBefore(){
+function restoreBefore(ok){
   let t = null;
   try { t = sanitizeTrip(JSON.parse(store.get(BEFORE_KEY))); } catch (e) {}
   if (!t) return toast('보관한 일정을 읽지 못했습니다.');
+  if (sync.cfg && ok !== true) return ask('보관한 일정을 다시 열까요?', '‘' + t.title + '’ · 장소 ' + countStops(t) + '곳. 동기화로 연결된 다른 기기의 일정도 이 일정으로 바뀝니다. 지금 일정은 보관해 둡니다.', '열기', () => restoreBefore(true));
   store.set(BEFORE_KEY, JSON.stringify(trip));          // a swap: the trip open now is kept in its place
   replaceTrip(t, '‘' + t.title + '’' + josa(t.title, '을', '를') + ' 다시 열었습니다. 방금 일정은 보관해 두었습니다.');
 }
@@ -3357,18 +3372,345 @@ function openPaste(){
   openView('paste', v => {
     const ta = h('textarea', {class: 'in', id: fid(), rows: 4, placeholder: '받은 일정 링크를 여기에 붙여 넣으세요', spellcheck: false, autocomplete: 'off'});
     const go = () => {
-      const c = linkCode(ta.value);
-      if (!c) return toast('링크에서 일정을 찾지 못했습니다. ‘#trip=’이 들어 있는 링크 전체를 붙여 넣어 주세요.', null, null, 5000);
-      closeView(); receiveLink(c);
+      const sc = syncCode(ta.value), c = linkCode(ta.value);
+      if (!sc && !c) return toast('링크에서 일정을 찾지 못했습니다. ‘#trip=’이나 ‘#sync=’가 들어 있는 링크 전체를 붙여 넣어 주세요.', null, null, 5000);
+      closeView();
+      if (sc) syncJoin(sc); else receiveLink(c);
     };
     put(v, vhead('받은 링크로 일정 열기', openTrip),
-      h('p', {class: 'hint', style: 'margin-bottom:12px'}, '카카오톡 등으로 받은 일정 링크를 붙여 넣으면 이 앱에서 엽니다. 아이폰 홈 화면 앱처럼 링크를 눌러도 앱으로 바로 열리지 않을 때 쓰세요.'),
+      h('p', {class: 'hint', style: 'margin-bottom:12px'}, '카카오톡 등으로 받은 일정 링크나 동기화 링크를 붙여 넣으면 이 앱에서 엽니다. 아이폰 홈 화면 앱처럼 링크를 눌러도 앱으로 바로 열리지 않을 때 쓰세요.'),
       field('일정 링크', ta),
       navigator.clipboard && navigator.clipboard.readText ? h('button', {class: 'btn wide', type: 'button', style: 'margin-bottom:8px', html: IC.open + '<span>복사해 둔 링크 붙여넣기</span>',
         onclick: async () => { try { ta.value = await navigator.clipboard.readText(); } catch (e) { toast('붙여넣기 권한이 없습니다. 입력칸을 길게 눌러 붙여 넣어 주세요.'); } }}) : null,
       h('button', {class: 'btn primary wide', type: 'button', onclick: go}, '이 일정 열기'));
     return ta;
   });
+}
+
+/* ================= one trip on several devices (동기화) ================= */
+// Turned on in 여행 정보, a trip stays the same on every device that opened its sync link. Each version is compressed
+// and sealed with AES-GCM on the device before it goes to the database (Firebase Realtime Database through its REST API
+// and event stream, no SDK). The key rides only in the link's #fragment, so the database keeps ciphertext it cannot
+// read. Its rules (build/firebase_rules.json) let whoever knows a room read the ciphertext and only a holder of the
+// room's lock write it, with a fresh nonce each time; nothing can be listed or deleted. Edits made offline wait and go
+// up on reconnect. Each version names the versions it grew from (h), so a device can tell a plain update from one that
+// passed over its own edits: then the other version stays, and this device's is kept aside, one tap away.
+const SYNC_DB = 'https://jeju-trip-sync-default-rtdb.asia-southeast1.firebasedatabase.app';
+const SYNC_MINE_KEY = 'jejumap.sync.mine', SYNC_RE = /sync=([A-Za-z0-9_-]{22})\.([A-Za-z0-9_-]{43})\.([A-Za-z0-9_-]{22})(?![A-Za-z0-9_-])/;
+const syncCode = s => { const m = SYNC_RE.exec(String(s || '')); return m ? {room: m[1], key: m[2], lock: m[3]} : null; };
+const syncOk = () => !!(window.isSecureContext && window.crypto && crypto.subtle && window.EventSource && window.DecompressionStream);
+const syncRand = n => b64u.enc(crypto.getRandomValues(new Uint8Array(n)));
+const syncUrl = p => SYNC_DB + p + '.json';
+const syncLink = c => location.origin + location.pathname + '#sync=' + c.room + '.' + c.key + '.' + c.lock;
+const syncCanon = t => JSON.stringify(sanitizeTrip(JSON.parse(JSON.stringify(t))));
+const syncKey = k => crypto.subtle.importKey('raw', b64u.dec(k), 'AES-GCM', false, ['encrypt', 'decrypt']);
+const syncBusy = () => !!(view || state.pick || play || askCb || vw);       // a remote version waits while the user is at work
+function syncSave(){ if (sync.cfg) store.set(SYNC_KEY, JSON.stringify(sync.cfg)); else try { localStorage.removeItem(SYNC_KEY); } catch (e) {} }
+// a version: its id, the ids it grew from (newest first), when it was made, and the whole trip
+const syncVersion = (c, t) => ({id: syncRand(9), h: c && c.synced ? [c.synced].concat(c.h || []).slice(0, 40) : [], at: Date.now(), trip: JSON.parse(JSON.stringify(t))});
+async function syncSeal(P, room, ck){
+  const raw = new TextEncoder().encode(JSON.stringify(P));
+  let body = raw, z = 'j';
+  if (window.CompressionStream) try { body = await streamBytes(raw, new CompressionStream('deflate')); z = 'z'; } catch (e) {}
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({name: 'AES-GCM', iv, additionalData: new TextEncoder().encode(room)}, ck, body);
+  return 'a1' + z + '.' + b64u.enc(iv) + '.' + b64u.enc(new Uint8Array(ct));
+}
+async function syncUnseal(s, room, ck){
+  const m = /^a1([zj])\.([A-Za-z0-9_-]{16})\.([A-Za-z0-9_-]+)$/.exec(s);
+  if (!m) throw new Error('format');
+  let body = new Uint8Array(await crypto.subtle.decrypt({name: 'AES-GCM', iv: b64u.dec(m[2]), additionalData: new TextEncoder().encode(room)}, ck, b64u.dec(m[3])));
+  if (m[1] === 'z') body = await streamBytes(body, new DecompressionStream('deflate'));
+  const o = JSON.parse(new TextDecoder().decode(body)), t = o && sanitizeTrip(o.trip);
+  if (!t || typeof o.id !== 'string') throw new Error('format');
+  return {id: o.id, h: Array.isArray(o.h) ? o.h.filter(x => typeof x === 'string').slice(0, 40) : [], at: +o.at || 0, trip: t};
+}
+async function syncFetch(path, opt){
+  const r = await fetch(syncUrl(path) + (opt ? '?print=silent' : ''), Object.assign({cache: 'no-store'}, opt));
+  if (!r.ok) throw new Error(path + ' ' + r.status);
+  return opt ? null : r.json();
+}
+// a write proves the lock with a fresh nonce: w = lock + n, and n must differ from the stored one
+const syncWrite = (c, sealed) => { const n = syncRand(12); return syncFetch('/rooms/' + c.room, {method: 'PUT', body: JSON.stringify({c: sealed, n, w: c.lock + n})}); };
+async function syncCreate(){
+  const c = {room: syncRand(16), key: syncRand(32), lock: syncRand(16), synced: '', h: [], own: true, dirty: false, at: 0};
+  const ck = await syncKey(c.key), P = syncVersion(null, trip), sealed = await syncSeal(P, c.room, ck), n = syncRand(12);
+  if (sealed.length > 480000) throw new Error('size');
+  await syncFetch('/', {method: 'PATCH', body: JSON.stringify({['locks/' + c.room]: c.lock, ['rooms/' + c.room]: {c: sealed, n, w: c.lock + n}})});
+  Object.assign(c, {synced: P.id, at: P.at});
+  return {c, ck, P};
+}
+function syncUse(c, ck, P){
+  syncStop();
+  Object.assign(sync, {cfg: c, ck, latest: P || null, state: 'ok', retry: 0, gen: 0});
+  syncSave(); syncStream(); syncFill();
+  if (P && syncCanon(trip) !== syncCanon(P.trip)) syncLocal();       // edited while the room was being made
+}
+function syncStop(){
+  if (sync.es) { sync.es.close(); sync.es = null; }
+  for (const k of ['pushT', 'settleT', 'echoT']) clearTimeout(sync[k]);
+  sync.waitEcho = null;
+}
+function syncOff(){
+  syncStop();
+  Object.assign(sync, {cfg: null, ck: null, latest: null, state: 'ok'});
+  syncSave(); syncFill();
+}
+
+/* ---- the stream: the room's ciphertext, sent again each time it changes ---- */
+function syncStream(){
+  const c = sync.cfg;
+  if (sync.es) { sync.es.close(); sync.es = null; }
+  if (!c || !sync.ck) return;
+  const es = sync.es = new EventSource(syncUrl('/rooms/' + c.room + '/c'));
+  es.addEventListener('put', e => {
+    let d = null;
+    try { d = JSON.parse(e.data); } catch (err) {}
+    if (d && d.path === '/') sync.q = sync.q.then(() => syncIncoming(d.data, c)).catch(() => {});      // one at a time, in order
+  });
+  es.addEventListener('cancel', () => { sync.state = 'error'; syncStatus(); });
+  es.onopen = () => syncStatus();
+  es.onerror = () => {
+    syncStatus();
+    if (es.readyState === 2) setTimeout(() => { if (sync.es === es && sync.cfg === c) syncStream(); }, 15000);   // given up: try again later
+  };
+}
+async function syncIncoming(data, c){
+  if (sync.cfg !== c) return;
+  if (data === '') return syncClosed();
+  if (typeof data !== 'string') { sync.state = data == null ? 'missing' : 'error'; return syncStatus(); }
+  let P;
+  try { P = await syncUnseal(data, c.room, sync.ck); } catch (e) { sync.state = 'error'; return syncStatus(); }
+  if (sync.cfg !== c) return;
+  sync.state = 'ok';
+  // a late answer (a slow read, a stream catching up) older than what this device already has or has seen: drop it
+  if (P.id !== c.synced && ((c.h || []).includes(P.id) || (!!sync.latest && sync.latest.id !== P.id && sync.latest.h.includes(P.id)))) return;
+  sync.latest = P;
+  // while our own write is on its way, what comes before its echo is older than it
+  if (sync.waitEcho) { if (P.id !== sync.waitEcho) return; sync.waitEcho = null; clearTimeout(sync.echoT); }
+  syncSettle();
+}
+async function syncRefresh(){
+  const c = sync.cfg;
+  if (!c || !sync.ck) return;
+  let d;
+  try { d = await syncFetch('/rooms/' + c.room + '/c'); } catch (e) { return syncRetry(); }
+  sync.q = sync.q.then(() => syncIncoming(d, c)).catch(() => {});
+}
+// the newest version in the room against this device's trip
+function syncSettle(){
+  const c = sync.cfg, P = sync.latest;
+  syncStatus();
+  if (!c || !P || sync.sending || sync.waitEcho) return;
+  // our own write, whose answer was lost on the way back: it did land
+  if (P.id === sync.tried && P.id !== c.synced) { Object.assign(c, {synced: P.id, h: P.h, at: P.at, own: true}); syncSave(); }
+  // up to date (or the room still shows a version this one grew from): send what waits, unless a retry is already timed
+  if (P.id === c.synced || (c.h || []).includes(P.id)) { if (c.dirty && !sync.retry && sync.state === 'ok') syncSoon(300); return; }
+  if (syncBusy()) { clearTimeout(sync.settleT); sync.settleT = setTimeout(syncSettle, 1500); return; }
+  const same = syncCanon(P.trip) === syncCanon(trip);
+  // a plain update: nothing unsent here, and it grew from what this device last sent (or this device only received)
+  if (same || (!c.dirty && (!c.own || P.h.includes(c.synced)))) return syncAdopt(P, same ? '' : '다른 기기에서 고친 일정을 받았습니다.');
+  sync.mine = JSON.stringify(trip);              // also in memory, in case storage is full
+  store.set(SYNC_MINE_KEY, sync.mine);
+  syncAdopt(P);
+  toast('다른 기기에서 고친 일정과 겹쳐 그쪽 일정으로 맞췄습니다. 이 기기에서 고친 내용은 따로 보관해 두었습니다.', '이 기기 것으로', syncRestoreMine, 12000);
+}
+function syncAdopt(P, msg){
+  Object.assign(sync.cfg, {synced: P.id, h: P.h, at: P.at, own: false, dirty: false});
+  syncSave();
+  sync.applying = true;
+  try { trip = JSON.parse(JSON.stringify(P.trip)); legOpen = null; commit(); } finally { sync.applying = false; }
+  syncStatus();
+  if (msg) toast(msg);
+}
+
+/* ---- sending this device's edits ---- */
+const syncSoon = ms => { clearTimeout(sync.pushT); sync.pushT = setTimeout(syncPush, ms); };
+const syncRetry = () => { sync.retry = Math.min(sync.retry + 1, 6); syncSoon(2000 * 2 ** sync.retry); syncStatus(); };
+function syncLocal(){
+  const c = sync.cfg;
+  if (!c || sync.applying) return;
+  sync.gen++;
+  if (!c.dirty) { c.dirty = true; syncSave(); }
+  syncSoon(1200); syncStatus();
+}
+async function syncPush(){
+  const c = sync.cfg;
+  if (!c || !c.dirty || sync.sending || sync.making || !sync.ck) return;
+  if (sync.state === 'error' || sync.state === 'missing') return syncStatus();   // never write over a version this device cannot read
+  if (!sync.latest) return syncRefresh();                    // what the room holds now comes first
+  // another device's version is newer: settle that first
+  if (sync.latest.id !== c.synced && !(c.h || []).includes(sync.latest.id)) return syncSettle();
+  if (navigator.onLine === false) return syncStatus();
+  const P = syncVersion(c, trip), gen = sync.gen, live = !!sync.es && sync.es.readyState === 1, before = sync.latest;
+  sync.sending = true; sync.tried = P.id;
+  if (sync.state === 'big') sync.state = 'ok';
+  syncStatus();
+  let ok = false;
+  try {
+    const sealed = await syncSeal(P, c.room, sync.ck);
+    if (sealed.length > 480000) { sync.state = 'big'; throw new Error('size'); }
+    if (live) sync.waitEcho = P.id;
+    await syncWrite(c, sealed);
+    ok = true;
+  } catch (e) { sync.waitEcho = null; }
+  sync.sending = false;
+  if (sync.cfg !== c) return syncSettle();       // moved to another room meanwhile: it may be waiting on this
+  if (ok) {
+    Object.assign(c, {synced: P.id, h: P.h, at: P.at, own: true, dirty: sync.gen !== gen});
+    syncSave(); sync.retry = 0;
+    // no stream when it left: it is the newest, unless the stream has since brought something
+    if (!live && sync.latest === before) sync.latest = P;
+    else if (sync.waitEcho === P.id) { clearTimeout(sync.echoT); sync.echoT = setTimeout(() => { if (sync.waitEcho === P.id) { sync.waitEcho = null; syncRefresh(); } }, 10000); }
+  } else if (sync.state !== 'big') syncRetry();
+  syncSettle();
+}
+addEventListener('online', () => { if (!sync.cfg) return; if (!sync.es || sync.es.readyState === 2) syncStream(); syncSoon(500); });
+addEventListener('offline', () => { if (sync.es) { sync.es.close(); sync.es = null; } syncStatus(); });     // a dead stream; 'online' starts it again
+// a phone app sent to the back loses its stream: back in front after a while, start it again (it brings the latest)
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { sync.hiddenAt = Date.now(); return; }
+  if (sync.cfg && sync.ck && (!sync.es || sync.es.readyState === 2 || Date.now() - sync.hiddenAt > 20000)) syncStream();
+});
+
+/* ---- turning it on, joining, a new link, turning it off ---- */
+async function syncEnable(){
+  if (!syncOk()) return toast('이 브라우저에서는 동기화를 쓸 수 없습니다.');
+  if (sync.making) return;
+  sync.making = true;
+  toast('동기화를 켜는 중입니다…', null, null, 15000);
+  try {
+    const {c, ck, P} = await syncCreate();
+    syncUse(c, ck, P);
+    toast('동기화를 켰습니다. ‘다른 기기 연결 링크 보내기’로 다른 기기를 연결하세요.', null, null, 6000);
+  } catch (e) { toast('동기화를 켜지 못했습니다. 인터넷 연결을 확인하고 다시 눌러 주세요.', null, null, 6000); }
+  sync.making = false;
+}
+async function syncJoin(code, src){
+  if (!syncOk()) return toast('이 브라우저에서는 동기화를 쓸 수 없습니다.');
+  if (sync.cfg && sync.cfg.room === code.room) return toast('이미 이 동기화 일정에 연결되어 있습니다.');
+  // KakaoTalk's own browser keeps its own storage: the sync belongs in the phone's browser or the home-screen app
+  if (/KAKAOTALK/i.test(UA) && src) return toast('카카오톡 안에서 열렸습니다. 동기화는 기본 브라우저나 홈 화면 앱에서 연결하세요.', '브라우저로 열기',
+    () => { location.href = 'kakaotalk://web/openExternal?url=' + encodeURIComponent(src); }, 15000);
+  let data, ck, P = null;
+  try { data = await syncFetch('/rooms/' + code.room + '/c'); }
+  catch (e) { return toast('동기화 일정을 받지 못했습니다. 인터넷 연결을 확인하고 링크를 다시 열어 주세요.', null, null, 6000); }
+  if (data === '') return toast('이 동기화 링크는 새 링크로 바뀌어 더 이상 쓰지 않습니다. 새 링크를 받아 주세요.', null, null, 6000);
+  try { ck = await syncKey(code.key); P = await syncUnseal(data, code.room, ck); } catch (e) {}
+  if (!P) return toast('동기화 링크를 읽지 못했습니다. 링크가 잘리지 않고 전부 복사됐는지 확인해 주세요.', null, null, 6000);
+  const mine = countStops(trip), n = countStops(P.trip);
+  const go = () => {
+    if (mine) store.set(BEFORE_KEY, JSON.stringify(trip));
+    sync.applying = true;
+    try { replaceTrip(JSON.parse(JSON.stringify(P.trip))); } finally { sync.applying = false; }
+    syncUse(Object.assign(code, {synced: P.id, h: P.h, own: false, dirty: false, at: P.at}), ck, P);
+    toast('동기화 일정 ‘' + P.trip.title + '’에 연결했습니다. 이제 다른 기기와 자동으로 맞춰집니다.', null, null, 6000);
+  };
+  if (!mine && !sync.cfg) return go();
+  ask('동기화 일정에 연결할까요?', '‘' + P.trip.title + '’ · ' + P.trip.days.length + '일 · 장소 ' + n + '곳. 연결하면 이 기기의 일정이 이것으로 바뀌고, 앞으로 다른 기기와 자동으로 맞춰집니다.' +
+    (mine ? ' 지금 일정(장소 ' + mine + '곳)은 이 기기에 보관해 두고, 여행 정보에서 다시 열 수 있습니다.' : '') +
+    (sync.cfg ? ' 지금 연결된 다른 동기화에서는 빠집니다.' : ''), '연결', go);
+}
+// the other devices hear of it through the old room, which is closed (emptied) once this device has moved to the new one
+function syncRotateAsk(){
+  ask('새 링크로 바꿀까요?', '새 동기화 링크를 만들고 지금 링크는 막습니다. 지금 링크로 연결된 다른 기기는 연결이 끊기니, 새 링크를 다시 보내 연결해 주세요. 어느 기기에서도 일정은 지워지지 않습니다.', '바꾸기', syncRotate);
+}
+async function syncRotate(){
+  const old = sync.cfg;
+  if (!old || sync.making) return;
+  sync.making = true;
+  clearTimeout(sync.pushT);
+  for (let k = 0; sync.sending && k < 150; k++) await new Promise(r => setTimeout(r, 200));
+  try {
+    const {c, ck, P} = await syncCreate();
+    syncUse(c, ck, P);
+    let closed = true;
+    try { await syncWrite(old, ''); } catch (e) { closed = false; }
+    toast(closed ? '새 링크로 바꿨습니다. 다른 기기에는 ‘다른 기기 연결 링크 보내기’로 새 링크를 보내 주세요.'
+      : '새 링크로 바꿨지만 예전 링크를 막지 못했습니다. 인터넷이 연결된 뒤 한 번 더 바꿔 주세요.', null, null, 8000);
+  } catch (e) { toast('새 링크를 만들지 못했습니다. 인터넷 연결을 확인하고 다시 해 주세요.', null, null, 6000); }
+  sync.making = false;
+}
+function syncClosed(){
+  syncOff();
+  toast('동기화 링크가 새 링크로 바뀌어 이 기기의 연결이 끊겼습니다. 일정은 그대로 남아 있습니다. 새 링크를 받아 다시 연결하세요.', null, null, 10000);
+}
+function syncOffAsk(){
+  const c = sync.cfg;
+  if (!c) return;
+  ask('이 기기의 동기화를 끌까요?', '이 기기는 동기화에서 빠지고, 일정은 이 기기에 그대로 남습니다. 다른 기기끼리는 계속 맞춰집니다.' +
+    (c.dirty ? ' 아직 올라가지 않은 수정은 다른 기기로 가지 않습니다.' : '') + ' 다시 연결하려면 다른 기기에서 연결 링크를 받아 여세요.', '끄기',
+    () => { syncOff(); toast('이 기기의 동기화를 껐습니다.'); });
+}
+// this device's version, set aside when another device's won: a swap, so the one open now is kept in its place
+function syncRestoreMine(){
+  let t = null;
+  try { t = sanitizeTrip(JSON.parse(sync.mine || store.get(SYNC_MINE_KEY))); } catch (e) {}
+  if (!t) return toast('보관한 일정을 읽지 못했습니다.');
+  sync.mine = JSON.stringify(trip);
+  store.set(SYNC_MINE_KEY, sync.mine);
+  replaceTrip(t, sync.cfg ? '이 기기에서 고친 일정으로 되돌렸습니다. 다른 기기에도 곧 반영됩니다.' : '보관한 일정을 다시 열었습니다.');
+}
+async function syncShare(){
+  const c = sync.cfg;
+  if (!c) return;
+  const url = syncLink(c);
+  if (navigator.share) {
+    try { await navigator.share({title: trip.title + ' · 동기화', text: '제주 여행 일정 ‘' + trip.title + '’ 동기화 링크', url}); return; }
+    catch (e) { if (e && e.name === 'AbortError') return; }
+  }
+  try { await navigator.clipboard.writeText(url); toast('동기화 링크를 복사했습니다. 다른 기기에서 열거나 ‘받은 링크로 일정 열기’에 붙여 넣으세요.', null, null, 6000); }
+  catch (e) { openLinkText(url); }
+}
+function syncBoot(){
+  let c = null;
+  try { c = JSON.parse(store.get(SYNC_KEY)); } catch (e) {}
+  if (!c || !syncOk() || !syncCode('sync=' + c.room + '.' + c.key + '.' + c.lock)) return;
+  // the stored trip could not be read and an empty one stands in: take the room's version, never send the empty one
+  if (rescued) Object.assign(c, {synced: '', h: [], own: false, dirty: false});
+  sync.cfg = c;
+  syncKey(c.key).then(ck => { if (sync.cfg === c) { sync.ck = ck; syncStream(); } }).catch(() => { sync.state = 'error'; });
+}
+
+/* ---- in 여행 정보 ---- */
+const syncWhen = ms => {
+  const d = new Date(ms), hm = String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+  return d.toDateString() === new Date().toDateString() ? hm : (d.getMonth() + 1) + '월 ' + d.getDate() + '일 ' + hm;
+};
+function syncText(){
+  const c = sync.cfg;
+  if (!c) return ['', ''];
+  if (sync.state === 'missing') return ['서버에서 이 동기화 일정을 찾지 못했습니다. 동기화를 끄고 다시 켜 주세요.', 'err'];
+  if (sync.state === 'error') return ['동기화 일정을 읽지 못했습니다. 다른 기기에서 연결 링크를 받아 다시 열어 주세요.', 'err'];
+  if (sync.state === 'big') return ['일정이 너무 커서 동기화하지 못했습니다.', 'err'];
+  if (navigator.onLine === false || !sync.es || sync.es.readyState !== 1)
+    return [c.dirty ? '인터넷 연결을 기다리는 중 · 고친 내용은 연결되면 올라갑니다' : '인터넷 연결을 기다리는 중', 'wait'];
+  if (sync.sending || c.dirty) return ['맞추는 중…', 'wait'];
+  return ['연결됨' + (c.at ? ' · 마지막 수정 ' + syncWhen(c.at) : ''), ''];
+}
+function syncStatus(el){
+  el = el || $('syncSt');            // the section's line, also before it is on the page
+  if (!el) return;
+  const [t, k] = syncText();
+  el.textContent = t; el.className = 'sync-st' + (k ? ' ' + k : '');
+}
+function syncBox(){ const b = h('div', {class: 'group', id: 'syncBox'}); syncFill(b); return b; }
+function syncFill(box){
+  box = box || $('syncBox');
+  if (!box) return;
+  box.textContent = '';
+  if (!sync.cfg) return put(box,
+    syncOk() ? h('button', {class: 'btn', type: 'button', html: IC.link + '<span>동기화 켜기</span>', onclick: syncEnable}) : null,
+    h('p', {class: 'hint'}, syncOk() ? '휴대폰과 PC처럼 여러 기기에서 같은 일정을 쓰고, 한 곳에서 고치면 다른 기기에도 바로 반영됩니다. 일정은 이 기기에서 암호화한 뒤 서버(Google Firebase)에 올라가, 서버는 내용을 읽을 수 없습니다. 사진은 각 기기에만 둡니다.'
+      : '이 브라우저에서는 동기화를 쓸 수 없습니다.'));
+  const st = h('p', {class: 'sync-st', id: 'syncSt', role: 'status'});
+  put(box, st,
+    h('button', {class: 'btn primary', type: 'button', html: IC.share + '<span>다른 기기 연결 링크 보내기</span>', onclick: syncShare}),
+    h('p', {class: 'hint'}, '이 링크를 다른 기기에서 열면 같은 일정에 연결됩니다. 아이폰 홈 화면 앱에서는 아래 ‘받은 링크로 일정 열기’에 붙여 넣으세요. 링크가 곧 열쇠라 가진 사람은 누구나 일정을 보고 고칠 수 있으니, 믿을 수 있는 곳으로만 보내세요.'),
+    sync.mine || store.get(SYNC_MINE_KEY) ? h('button', {class: 'btn', type: 'button', onclick: syncRestoreMine}, '겹쳐서 따로 보관한 일정 열기') : null,
+    h('button', {class: 'btn', type: 'button', onclick: syncRotateAsk}, '새 링크로 바꾸기 (지금 링크 막기)'),
+    h('button', {class: 'btn danger', type: 'button', onclick: syncOffAsk}, '이 기기 동기화 끄기'));
+  syncStatus(st);
 }
 
 /* ================= photo journal ================= */
@@ -3593,6 +3935,42 @@ if ('serviceWorker' in navigator && window.isSecureContext) {
 addEventListener('beforeinstallprompt', e => { e.preventDefault(); pwa.install = e; });
 addEventListener('appinstalled', () => { pwa.install = null; toast('홈 화면에 앱을 추가했습니다.'); });
 
+/* ---- what's new: shown once after an update ---- */
+// Newest first. Someone who used an earlier version (a trip saved here, or the installed app) sees the newest note once,
+// after the update has opened; a first visit marks it seen without showing it. 여행 정보 can show it again.
+const SEEN_KEY = 'jejumap.seen';
+const NEWS = [{v: '2026.11.27-11', kick: '이번 업데이트', title: '새 기능: 기기 간 동기화',
+  body: '휴대폰과 PC처럼 여러 기기에서 같은 일정을 쓸 수 있습니다. 한 곳에서 고치면 다른 기기에도 몇 초 안에 반영됩니다.',
+  steps: [['일정이 들어 있는 기기에서 ', '여행 정보 → 기기 간 동기화 → 동기화 켜기', '를 누릅니다.'],
+    ['', '다른 기기 연결 링크 보내기', '로 링크를 다른 기기에 보냅니다.'],
+    ['다른 기기에서 그 링크를 열면 연결됩니다. 아이폰 홈 화면 앱은 링크를 복사해 ', '받은 링크로 일정 열기', '에 붙여 넣으세요.']],
+  note: '일정은 기기에서 암호화된 뒤 올라가 서버도 내용을 읽지 못합니다. 연결하는 기기의 일정은 동기화 일정으로 바뀌고, 원래 일정은 따로 보관됩니다. 사진은 각 기기에만 둡니다.',
+  go: '지금 켜 보기', fn: () => openSyncInfo()}];
+function showNews(){
+  const n = NEWS[0];
+  store.set(SEEN_KEY, n.v);
+  const more = h('div', null,
+    h('ol', {class: 'news-steps'}, n.steps.map(([a, b, c]) => h('li', null, a, h('b', null, b), c))),
+    h('p', {class: 'news-note'}, n.note));
+  ask(n.title, n.body, n.go, n.fn, null, {kick: n.kick, more, no: '닫기'});
+}
+// 여행 정보, scrolled to the sync section, its first button in focus
+function openSyncInfo(){
+  openTrip();
+  const b = $('syncBox');
+  if (!b) return;
+  scroller.scrollTop += b.getBoundingClientRect().top - scroller.getBoundingClientRect().top - 120;
+  const btn = b.querySelector('button');
+  if (btn) btn.focus({preventScroll: true});
+}
+function newsAtStart(hadLink){
+  const seen = store.get(SEEN_KEY);
+  if (seen === NEWS[0].v) return;
+  if (!seen && !store.get(TRIP_KEY) && !standalone()) return store.set(SEEN_KEY, NEWS[0].v);   // a first visit
+  if (hadLink) return;                      // a link is being opened: next time
+  setTimeout(() => { if (!askCb && !view && !state.pick && !play && !vw) showNews(); }, 1500);
+}
+
 /* ---- static wiring ---- */
 $('hudToggle').addEventListener('click', () => pausePlay(!play.paused));
 $('hudStop').innerHTML = IC.close; $('hudStop').addEventListener('click', stopPlay);
@@ -3668,12 +4046,14 @@ if (todayOn() && navigator.geolocation && navigator.permissions && window.isSecu
 loadPhotos();
 // a trip sent as a link (#trip=...): read it, then take it out of the address so a reload does not ask again
 const takeLink = () => {
-  const c = linkCode(location.hash);
-  if (!c) return;
+  const sc = syncCode(location.hash), c = sc ? '' : linkCode(location.hash);
+  if (!sc && !c) return;
   const src = location.href;
-  history.replaceState(history.state, '', location.pathname + location.search);
-  setTimeout(() => receiveLink(c, src), 600);
+  history.replaceState(history.state, '', location.pathname + location.search);     // the key leaves the address bar too
+  setTimeout(() => sc ? syncJoin(sc, src) : receiveLink(c, src), 600);
 };
+syncBoot();
+newsAtStart(!!(syncCode(location.hash) || linkCode(location.hash)));
 takeLink();
 addEventListener('hashchange', takeLink);
 // a stored trip this version could not read was set aside, never overwritten: offer it as a file
@@ -3694,6 +4074,10 @@ window.__jeju = {cam, goal, state, mover, get mode(){ return moverMode; }, get p
   // today, location, directions, reordering, links, photos
   setToday, checkIn, todayIndex, me, dayPlan, openOrder, costMatrix, bestOrder, pathCost, kakaoUrl, naverPath, openNav,
   packTrip, unpackTrip, linkCode, receiveLink, makeLink, shareTrip, openPaste, restoreBefore,
+  showNews, get seen(){ return store.get(SEEN_KEY); },
+  sync: {get cfg(){ return sync.cfg; }, get latest(){ return sync.latest && {id: sync.latest.id, h: sync.latest.h}; }, get status(){ return syncText()[0]; },
+    get stream(){ return sync.es ? sync.es.readyState : -1; }, get mine(){ return !!(sync.mine || store.get(SYNC_MINE_KEY)); }, get busy(){ return syncBusy(); },
+    enable: syncEnable, join: syncJoin, code: syncCode, link: () => sync.cfg && syncLink(sync.cfg), off: syncOff, rotate: syncRotate, restoreMine: syncRestoreMine},
   async addPhoto(d, i, blob){ const r = await addPhotos(trip.days[d].stops[i], [blob]); if (!play) rebuildScene(); return r; }, photosOf: (d, i) => photosOf(trip.days[d].stops[i]).length,
   openViewer, get viewer(){ return vw && {k: vw.k, sid: vw.sid}; }, strayPhotos, get photoFailed(){ return PH.failed; },
   async loadExample(src){ replaceTrip(sanitizeTrip(src || await (await fetch('data/example_trip.json')).json())); },   // src: a test's own trip

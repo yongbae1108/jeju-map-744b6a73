@@ -325,6 +325,10 @@ body.sheet-full #ctl,body.sheet-full #hud{visibility:hidden}
 .s-time.eta{font-style:italic;color:#8a826c}
 .s-late{display:block;margin-top:2px;font-size:12px;font-weight:600;color:var(--terra-deep)}
 .hint.warn{color:var(--terra-deep);font-weight:600}
+.sync-st{margin:0;font-size:14px;font-weight:700;color:var(--teal-deep)}
+.sync-st::before{content:"";display:inline-block;width:8px;height:8px;margin-right:8px;border-radius:50%;background:currentColor;vertical-align:1px}
+.sync-st.wait{color:var(--ink-soft)}
+.sync-st.err{color:var(--terra-deep)}
 .day-tools{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;margin:8px 0 4px 44px}
 .day-tools .hint{flex:1 1 180px;font-size:12px}
 .leg-nav{margin:0 0 8px;color:var(--teal-deep);max-width:100%;white-space:normal;text-align:left;padding-top:6px;padding-bottom:6px}
@@ -385,6 +389,15 @@ body.sheet-full #ctl,body.sheet-full #hud{visibility:hidden}
 .scrim.stack .row{grid-template-columns:1fr}
 .scrim.stack #askYes{order:-2}
 .scrim.stack #askAlt{order:-1}
+/* the what's-new notice: the same dialog, a little wider, with numbered steps */
+.scrim.news .dialog{width:min(380px,100%);max-height:100%;overflow:auto}
+.scrim.news #askBody{margin-bottom:12px;color:var(--ink);font-size:15px}
+.dialog .kick{margin:0 0 4px;font-size:12px;font-weight:700;letter-spacing:.06em;color:var(--terra)}
+.news-steps{margin:0 0 12px;padding-left:22px;font-size:14px;line-height:1.55}
+.news-steps li{margin:0 0 6px;padding-left:2px}
+.news-steps li::marker{font-family:var(--serif-en);font-weight:600;color:var(--terra)}
+.news-steps b{color:var(--teal-deep)}
+.dialog .news-note{margin:0 0 16px;padding-top:10px;border-top:1px solid var(--line-soft);font-size:12.5px}
 
 /* ---------- desktop: the sheet becomes a fixed left panel, the map a card ---------- */
 @media (min-width:900px){
@@ -473,8 +486,10 @@ body.sheet-full #ctl,body.sheet-full #hud{visibility:hidden}
 <div id="toast" role="status" aria-live="polite"><span id="toastText"></span><button id="toastAct" type="button" hidden></button></div>
 <div id="ask" class="scrim" hidden>
   <div class="dialog paper" role="alertdialog" aria-modal="true" aria-labelledby="askTitle" aria-describedby="askBody">
+    <p id="askKick" class="kick" hidden></p>
     <h2 id="askTitle"></h2>
     <p id="askBody"></p>
+    <div id="askMore" hidden></div>
     <div class="row"><button id="askNo" class="btn" type="button">취소</button><button id="askAlt" class="btn" type="button" hidden></button><button id="askYes" class="btn primary" type="button">삭제</button></div>
   </div>
 </div>
