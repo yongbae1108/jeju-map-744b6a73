@@ -8,5 +8,5 @@
 - 도로·건물·숲·장소: © OpenStreetMap contributors, [ODbL](https://opendatacommons.org/licenses/odbl/)
 - 지형: Mapzen Terrain Tiles (SRTM, GMTED2010, ETOPO1 등)
 - 3D 그리기: [three.js](https://threejs.org/) r128 (MIT)
-- 글꼴: 고운바탕, Fraunces (SIL Open Font License 1.1, `fonts/OFL-*.txt`)
+- 글꼴: 나눔고딕, Fraunces (SIL Open Font License 1.1, `fonts/OFL-*.txt`)
 - 주소 검색: Esri ArcGIS World Geocoder (검색어만 Esri로 전송)

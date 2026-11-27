@@ -58,7 +58,7 @@ const ptList = (a, n) => Array.isArray(a) ? a.filter(p => Array.isArray(p) && p.
 const airOf = o => o && ptList(o.path, 3).length > 1 ? {path: ptList(o.path, 3), taxi: ptList(o.taxi, 2)} : null;
 // Saved trips outlive app updates: every stored trip carries the schema version it was written with, older versions are
 // migrated step by step here, and fields this version does not know are kept so an update never drops them.
-const APP_VERSION = '2026.11.27-9', SCHEMA = 2;
+const APP_VERSION = '2026.11.27-10', SCHEMA = 2;
 let bootSec = '', dataSec = '';
 const MIGRATE = {
   1: o => { o.air = o.air !== false; return o; }      // v1 (before 2026-11-27): no airport flights yet -> on by default
@@ -193,21 +193,49 @@ function gridM(x, z){
 // About 560-600 m east-west and 375-400 m north-south, floor 1,838 m, rim up to 1,947 m on the west, the lake 1-2 m
 // deep (Encyclopedia of Korean Culture). The centre, the east rim (the summit marker and its steps) and the lake's
 // outline (about 110 m east-west by 135 m north-south) follow OpenStreetMap. Inside a block of grid cells around it
-// the ground follows this shape, drawn by a 10 m mesh; past the rim it eases back into the grid well before the edge.
+// the ground follows this shape, drawn by a 10 m mesh. Outside the rim the summit falls away as a broad dome that
+// meets the grid well before the block's edge, so the crater sits on the mountain instead of on top of it.
 const CR = (() => {
   const cx = toX(126.5333), cz = toZ(33.3621);
   const fi = Math.round((cx + WX / 2) / WX * (GW - 1)), fj = Math.round((cz + WZ / 2) / WZ * (GH - 1));
-  const i0 = fi - 6, i1 = fi + 6, j0 = fj - 5, j1 = fj + 5, gx = i => -WX / 2 + i / (GW - 1) * WX, gz = j => -WZ / 2 + j / (GH - 1) * WZ;
-  return {cx, cz, a: 0.28, b: 0.195, la: 0.056, lb: 0.068, r2: 1.9, floor: 1838, lake: 1839.5, i0, i1, j0, j1, x0: gx(i0), x1: gx(i1), z0: gz(j0), z1: gz(j1)};
+  const i0 = fi - 8, i1 = fi + 8, j0 = fj - 6, j1 = fj + 6, gx = i => -WX / 2 + i / (GW - 1) * WX, gz = j => -WZ / 2 + j / (GH - 1) * WZ;
+  return {cx, cz, a: 0.28, b: 0.195, r2: 2.4, lake: 1839.5, i0, i1, j0, j1, x0: gx(i0), x1: gx(i1), z0: gz(j0), z1: gz(j1)};
 })();
+// the lake's shore (OpenStreetMap way 199548046, © OpenStreetMap contributors)
+const LAKE = [[33.362528, 126.532692], [33.362405, 126.532691], [33.362173, 126.532804], [33.362047, 126.532922], [33.361977, 126.533057],
+  [33.361968, 126.533326], [33.361927, 126.533425], [33.361843, 126.533436], [33.361723, 126.533446], [33.361645, 126.533493],
+  [33.361535, 126.533659], [33.361487, 126.53375], [33.361508, 126.533859], [33.361654, 126.533864], [33.361851, 126.533835],
+  [33.362088, 126.533835], [33.362303, 126.5338], [33.362451, 126.533684], [33.3626, 126.533615], [33.362692, 126.533477],
+  [33.362704, 126.533278], [33.362682, 126.533121], [33.36262, 126.532837]].map(([la, lo]) => [toX(lo), toZ(la)]);
 const sstep = (e0, e1, v) => { const t = clamp((v - e0) / (e1 - e0), 0, 1); return t * t * (3 - 2 * t); };
+// metres to the lake's shore, negative on the water
+function lakeDist(x, z){
+  let d = Infinity, inside = false;
+  for (let i = 0, j = LAKE.length - 1; i < LAKE.length; j = i++) {
+    const [xi, zi] = LAKE[i], [xj, zj] = LAKE[j], ex = xj - xi, ez = zj - zi;
+    if ((zi > z) !== (zj > z) && x < ex * (z - zi) / ez + xi) inside = !inside;
+    const t = clamp(((x - xi) * ex + (z - zi) * ez) / (ex * ex + ez * ez || 1), 0, 1);
+    d = Math.min(d, Math.hypot(x - xi - ex * t, z - zi - ez * t));
+  }
+  return (inside ? -d : d) * 1000;
+}
+// position within the crater: r = 1 on the rim, which wanders a little (a crater is not drawn with a compass)
+function craterR(x, z){
+  const dx = (x - CR.cx) / CR.a, dz = (z - CR.cz) / CR.b, th = Math.atan2(dz, dx);
+  return {th, r: Math.hypot(dx, dz) / (1 + 0.05 * Math.sin(2 * th + 0.7) + 0.035 * Math.sin(3 * th + 2.1) + 0.02 * Math.sin(5 * th + 4))};
+}
+// how much of the crater shape holds at r: all of it inside the rim, then it lets go fast just outside the crest and
+// more slowly further down (steep upper slopes that settle into the mountain, not a plateau that ends in a step)
+const craterW = r => r <= 1 ? 1 : (1 - clamp((r - 1) / (CR.r2 - 1), 0, 1)) ** 2;
 function craterM(x, z, base){
-  const dx = (x - CR.cx) / CR.a, dz = (z - CR.cz) / CR.b, r = Math.hypot(dx, dz);
+  const {r, th} = craterR(x, z);
   if (r >= CR.r2) return base;
-  const rim = 1930 - 15 * (r > 1e-6 ? dx / r : 0);                      // 1,945 m on the west, 1,915 m on the east
-  if (r > 1) return rim + (base - rim) * sstep(1, CR.r2, r);             // the outer slope eases into the grid
-  const fl = CR.floor + 1.5 * (((x - CR.cx) / CR.la) ** 2 + ((z - CR.cz) / CR.lb) ** 2);   // a shallow floor, the lake's outline at 1,839.5 m
-  return fl + (rim - fl) * sstep(0.45, 1, r);                            // steep walls up to the rim
+  const rim = 1928 - 14 * Math.cos(th) + 6 * Math.sin(3 * th + 1.3) + 3 * Math.sin(7 * th + 0.4);   // highest on the west, an uneven crest
+  if (r > 1) return base + (rim - base) * craterW(r);              // the outer slopes ease into the mountain
+  // the floor: 1-2 m of water in the lake's outline, then ground rising gently away from the shore, a little uneven
+  const s = lakeDist(x, z);
+  const fl = s < 0 ? CR.lake - 2 * sstep(0, 40, -s) : CR.lake + s * 0.055 + 0.6 * Math.sin(x * 61 + z * 23) * Math.sin(z * 47 - x * 19) * sstep(0, 25, s);
+  return fl + (rim - fl) * sstep(0.42, 1, r);                      // walls up to the rim, gentle at their foot
 }
 const inCrater = (x, z) => x > CR.x0 && x < CR.x1 && z > CR.z0 && z < CR.z1;
 // the grid vertices and weights behind gridM at (x, z), so the crater mesh can borrow the grid's colours and normals
@@ -306,14 +334,18 @@ const crater = (() => {
   const own = new Float32Array(n), bary = [];
   for (let k = 0; k < n; k++) {
     const x = pos[k * 3], z = pos[k * 3 + 2];
-    own[k] = 1 - sstep(1.15, CR.r2, Math.hypot((x - CR.cx) / CR.a, (z - CR.cz) / CR.b));
+    own[k] = craterW(craterR(x, z).r);                                // the same weight the heights blend with
     bary.push(gridBary(x, z));
   }
-  const sx = (CR.x1 - CR.x0) / (nx - 1) * 1000, sz = (CR.z1 - CR.z0) / (nz - 1) * 1000, rock = lin('#958b7c'), c = new THREE.Color();
+  const sx = (CR.x1 - CR.x0) / (nx - 1) * 1000, sz = (CR.z1 - CR.z0) / (nz - 1) * 1000, c = new THREE.Color();
+  const rock = lin('#958b7c'), meadow = lin('#aeac86'), damp = lin('#7a7660');
   for (let q = 0; q < nz; q++) for (let p = 0; p < nx; p++) {
-    const k = q * nx + p, h = i => hm[clamp(i, 0, n - 1)], [k0, w0, k1, w1, k2, w2] = bary[k];
+    const k = q * nx + p, h = i => hm[clamp(i, 0, n - 1)], [k0, w0, k1, w1, k2, w2] = bary[k], r = craterR(pos[k * 3], pos[k * 3 + 2]).r;
     const slope = Math.hypot((h(k + (p < nx - 1 ? 1 : 0)) - h(k - (p > 0 ? 1 : 0))) / (2 * sx), (h(k + (q < nz - 1 ? nx : 0)) - h(k - (q > 0 ? nx : 0))) / (2 * sz));
-    landColor(hm[k], c).lerp(rock, clamp((slope - 0.45) / 0.5, 0, 0.75));
+    landColor(hm[k], c);
+    c.lerp(meadow, 0.4 * (1 - sstep(0.4, 0.62, r)));                                   // grass on the crater floor
+    c.lerp(rock, Math.max(clamp((slope - 0.45) / 0.5, 0, 0.75), 0.35 * sstep(0.75, 1, r) * (1 - sstep(1, 1.7, r))));   // bare rock on the walls and the crest
+    if (r < 0.7) c.lerp(damp, 0.6 * (1 - clamp((hm[k] - CR.lake) / 1.5, 0, 1)));      // wet ground along the water
     for (let ch = 0; ch < 3; ch++) {
       const g = tCol[k0 * 3 + ch] * w0 + tCol[k1 * 3 + ch] * w1 + tCol[k2 * 3 + ch] * w2;
       col[k * 3 + ch] = g + ([c.r, c.g, c.b][ch] - g) * own[k];
@@ -323,19 +355,24 @@ const crater = (() => {
   for (let q = 0; q < nz - 1; q++) for (let p = 0; p < nx - 1; p++) {
     const a = q * nx + p, b = a + 1, d = a + nx, e = d + 1;
     idx.push(a, d, b, b, d, e);
-    const r = Math.hypot((pos[a * 3] - CR.cx) / CR.a, (pos[a * 3 + 2] - CR.cz) / CR.b);      // only inside the crater: the outer slopes lie lower too
-    if (r < 0.7 && Math.min(hm[a], hm[b], hm[d], hm[e]) < CR.lake) lakePts.push(a, d, b, b, d, e);
+    // only inside the crater (the outer slopes lie lower too)
+    if (craterR(pos[a * 3], pos[a * 3 + 2]).r < 0.7 && Math.min(hm[a], hm[b], hm[d], hm[e]) < CR.lake) lakePts.push(a, d, b, b, d, e);
   }
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
   geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
   geo.setIndex(idx);
   scene.add(new THREE.Mesh(geo, terrainMat));
-  const lpos = new Float32Array(lakePts.length * 3);
-  lakePts.forEach((k, m) => { lpos[m * 3] = pos[k * 3]; lpos[m * 3 + 2] = pos[k * 3 + 2]; });
+  // still water: pale where the bottom shows through at the edge, deeper teal towards the middle
+  const lpos = new Float32Array(lakePts.length * 3), lcol = new Float32Array(lakePts.length * 3), shallow = lin('#93bfae'), deep = lin('#2c7782');
+  lakePts.forEach((k, m) => {
+    lpos[m * 3] = pos[k * 3]; lpos[m * 3 + 2] = pos[k * 3 + 2];
+    c.copy(shallow).lerp(deep, sstep(0, 1.8, CR.lake - hm[k])); lcol[m * 3] = c.r; lcol[m * 3 + 1] = c.g; lcol[m * 3 + 2] = c.b;
+  });
   const lgeo = new THREE.BufferGeometry();
   lgeo.setAttribute('position', new THREE.BufferAttribute(lpos, 3));
-  const lake = new THREE.Mesh(lgeo, new THREE.MeshStandardMaterial({color: lin('#3f8d95'), roughness: 0.22, metalness: 0.1, transparent: true, opacity: 0.9, depthWrite: false}));
+  lgeo.setAttribute('color', new THREE.BufferAttribute(lcol, 3));
+  const lake = new THREE.Mesh(lgeo, new THREE.MeshStandardMaterial({vertexColors: true, roughness: 0.12, metalness: 0.05, transparent: true, opacity: 0.92, depthWrite: false}));
   lake.renderOrder = 1; scene.add(lake);
   function setY(){
     const e = state.exag * 0.001;
