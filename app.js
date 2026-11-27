@@ -58,7 +58,7 @@ const ptList = (a, n) => Array.isArray(a) ? a.filter(p => Array.isArray(p) && p.
 const airOf = o => o && ptList(o.path, 3).length > 1 ? {path: ptList(o.path, 3), taxi: ptList(o.taxi, 2)} : null;
 // Saved trips outlive app updates: every stored trip carries the schema version it was written with, older versions are
 // migrated step by step here, and fields this version does not know are kept so an update never drops them.
-const APP_VERSION = '2026.11.27-4', SCHEMA = 2;
+const APP_VERSION = '2026.11.27-5', SCHEMA = 2;
 let bootSec = '', dataSec = '';
 const MIGRATE = {
   1: o => { o.air = o.air !== false; return o; }      // v1 (before 2026-11-27): no airport flights yet -> on by default
@@ -74,14 +74,28 @@ const extra = (o, known) => {
   if (o && typeof o === 'object') for (const k in o) if (!known.includes(k) && k.length < 40) { try { if (JSON.stringify(o[k]).length <= 4000) r[k] = o[k]; } catch (e) {} }
   return r;
 };
-const STOP_KEYS = ['name', 'lat', 'lon', 'time', 'memo', 'dep', 'coast', 'by', 'stroll', 'walk', 'airIn', 'airOut'];
+const STOP_KEYS = ['id', 'name', 'lat', 'lon', 'time', 'stay', 'memo', 'dep', 'coast', 'by', 'stroll', 'walk', 'airIn', 'airOut', 'done', 'doneAt'];
+// every stop carries a short id that stays with it when it moves; photos (kept outside the trip) point at it
+const newId = () => Math.random().toString(36).slice(2, 10).padEnd(8, '0');
+let idsAdded = false;
 function sanitizeTrip(o){
   if (!o || !Array.isArray(o.days)) return null;
   o = migrateTrip(o);
+  idsAdded = false;
+  const seen = new Set(), sid = v => {
+    let id = typeof v === 'string' && /^[a-z0-9]{4,16}$/.test(v) && !seen.has(v) ? v : '';
+    if (!id) { do id = newId(); while (seen.has(id)); idsAdded = true; }
+    seen.add(id); return id;
+  };
   const days = o.days.slice(0, 30).map(d => Object.assign(extra(d, ['title', 'note', 'stops']), {
     title: String((d && d.title) || '').slice(0, 60), note: String((d && d.note) || '').slice(0, 200),
     stops: (Array.isArray(d && d.stops) ? d.stops : []).filter(s => s && isFinite(+s.lat) && isFinite(+s.lon)).slice(0, 40).map(s => Object.assign(extra(s, STOP_KEYS), {
+      id: sid(s.id),
       name: String(s.name || '이름 없는 장소').slice(0, 60),
+      // minutes spent at the stop (null: a default by the kind of place), for the arrival estimates
+      stay: typeof s.stay === 'number' && Number.isInteger(s.stay) && s.stay >= 0 && s.stay <= 720 ? s.stay : null,
+      // checked off on the day itself ('오늘'), with the time it was checked
+      done: s.done === true, doneAt: s.done === true && /^\d{2}:\d{2}$/.test(s.doneAt) ? s.doneAt : '',
       lat: clamp(+s.lat, T.lat1, T.lat0), lon: clamp(+s.lon, T.lon0, T.lon1),
       time: /^\d{2}:\d{2}$/.test(s.time) ? s.time : '', memo: String(s.memo || '').slice(0, 200),
       // how this stop is reached from the one before: '' car (default), 'bus', 'walk'; coast = car along the coast
@@ -109,11 +123,13 @@ function loadTrip(){
   return emptyTrip();
 }
 let trip = loadTrip();
+// a trip saved before stops had ids gets them now, and keeps them (photos are filed under them)
+if (idsAdded && !rescued && store.get(TRIP_KEY)) store.set(TRIP_KEY, JSON.stringify(trip));
 // ask the browser not to evict our storage under pressure (granted for installed web apps on Android; harmless elsewhere)
 try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {}); } catch (e) {}
 
 const state = {
-  day: trip.days.length > 1 ? -1 : 0, sel: null, pick: null,
+  day: trip.days.length > 1 ? -1 : 0, sel: null, pick: null, today: false, todayDay: -1,
   exag: clamp(parseFloat(store.get('jejumap.exag')) || 1.6, 1, 4),
   geo: store.get('jejumap.geo') !== '0', roads: store.get('jejumap.roads') !== '0', bld: store.get('jejumap.bld') !== '0'
 };
@@ -431,10 +447,10 @@ const hav = (a, b) => {
 const legCache = new Map();
 // one leg of the day: along the roads when both ends reach the network, otherwise a straight hop (a ferry if it is over water).
 // b.coast asks for a route that keeps to the coastal roads.
-function routeLeg(a, b){
+function routeLeg(a, b, noCache){         // noCache: a one-off start (the phone's position), not worth keeping
   const coast = !!b.coast;
   const key = a.lat.toFixed(5) + ',' + a.lon.toFixed(5) + '|' + b.lat.toFixed(5) + ',' + b.lon.toFixed(5) + (coast ? '|coast' : '');
-  let leg = legCache.get(key);
+  let leg = noCache ? null : legCache.get(key);
   if (leg) return leg;
   const ax = toX(a.lon), az = toZ(a.lat), bx = toX(b.lon), bz = toZ(b.lat);
   if (G) {
@@ -454,8 +470,36 @@ function routeLeg(a, b){
     for (let i = 1; i < 20; i++) if (groundM(ax + (bx - ax) * i / 20, az + (bz - az) * i / 20) === 0) sea++;
     leg = {kind: sea > 7 ? 'ferry' : 'direct', km: hav(a, b), min: null, pts: [[ax, az], [bx, bz]]};
   }
-  legCache.set(key, leg);
+  if (!noCache) legCache.set(key, leg);
   return leg;
+}
+// Driving minutes and km from one road node to several others at once: one Dijkstra that stops when every target is
+// settled (the day's reordering needs all pairs; n searches instead of n² A*).
+function roadFrom(s, targets){
+  const {off, to, wt, ln, n} = G;
+  if (!G.dg) { G.dg = new Float64Array(n); G.dk = new Float64Array(n); }
+  const g = G.dg, km = G.dk, want = new Set(targets), hn = [s], hg = [0];
+  g.fill(Infinity); g[s] = 0; km[s] = 0; want.delete(s);
+  while (hn.length && want.size) {
+    const u = hn[0], gu = hg[0], ln0 = hn.pop(), lg = hg.pop();
+    if (hn.length) {
+      let i = 0; const N = hn.length;
+      for (;;) { let c = i * 2 + 1; if (c >= N) break; if (c + 1 < N && hg[c + 1] < hg[c]) c++; if (hg[c] >= lg) break; hn[i] = hn[c]; hg[i] = hg[c]; i = c; }
+      hn[i] = ln0; hg[i] = lg;
+    }
+    if (gu > g[u]) continue;
+    want.delete(u);
+    for (let p = off[u]; p < off[u + 1]; p++) {
+      const v = to[p], ng = gu + wt[p];
+      if (ng < g[v]) {
+        g[v] = ng; km[v] = km[u] + ln[p];
+        let i = hn.length; hn.push(v); hg.push(ng);
+        while (i > 0) { const q = (i - 1) >> 1; if (hg[q] <= ng) break; hn[i] = hn[q]; hg[i] = hg[q]; i = q; }
+        hn[i] = v; hg[i] = ng;
+      }
+    }
+  }
+  return targets.map(t => ({h: g[t], km: km[t]}));
 }
 
 /* ---- Jeju International Airport: arrival from the northern sea onto runway 07, departure back over the sea ---- */
@@ -960,6 +1004,7 @@ function fitBox(x0, x1, z0, z1, pad){
   clampGoal();
 }
 function fitStops(stops){
+  if (me.follow) setFollow(false);
   if (!stops.length) return fitIsland();
   let x0 = 1e9, x1 = -1e9, z0 = 1e9, z1 = -1e9;
   for (const s of stops) { const x = toX(s.lon), z = toZ(s.lat); x0 = Math.min(x0, x); x1 = Math.max(x1, x); z0 = Math.min(z0, z); z1 = Math.max(z1, z); }
@@ -997,7 +1042,7 @@ const pinchState = () => {
   const [a, b] = [...pointers.values()];
   return {cx: (a.x + b.x) / 2, cy: (a.y + b.y) / 2, d: Math.hypot(b.x - a.x, b.y - a.y) || 1, ang: Math.atan2(b.y - a.y, b.x - a.x)};
 };
-function userMoved(){ if (orbit) setOrbit(false); if (play && !play.paused) pausePlay(true); }
+function userMoved(){ if (orbit) setOrbit(false); if (play && !play.paused) pausePlay(true); if (me.follow) setFollow(false); }
 function panBy(ax, ay, bx, by){
   const a = planeHit(ax, ay, cam.ty), b = planeHit(bx, by, cam.ty);
   if (!a || !b) return;
@@ -1119,7 +1164,14 @@ const IC = {
   globe: svg('<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18"/>'),
   chev: svg('<path d="M6 9l6 6 6-6"/>'),
   plane: svg('<path d="M10.5 3.5c0-.8.7-1.5 1.5-1.5s1.5.7 1.5 1.5V9l7 4v2l-7-2v4.5l2 1.5v1.5L12 20l-3.5 1.5V20l2-1.5V13l-7 2v-2l7-4z"/>'),
-  addPin: svg('<path d="M12 21s-7-6.2-7-11a7 7 0 0 1 14 0c0 4.8-7 11-7 11z"/><path d="M12 7v6M9 10h6"/>')
+  addPin: svg('<path d="M12 21s-7-6.2-7-11a7 7 0 0 1 14 0c0 4.8-7 11-7 11z"/><path d="M12 7v6M9 10h6"/>'),
+  locate: svg('<circle cx="12" cy="12" r="6.5"/><circle cx="12" cy="12" r="2.2" fill="currentColor"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/>'),
+  check: svg('<path d="M5 12.5l4.5 4.5L19 7.5"/>'),
+  camera: svg('<path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/>'),
+  nav: svg('<path d="M4 11l16-7-7 16-2-7z"/>'),
+  sort: svg('<circle cx="5" cy="6" r="2"/><circle cx="19" cy="18" r="2"/><path d="M7 6h7a3 3 0 0 1 0 6h-4a3 3 0 0 0 0 6h7"/><path d="M15 15l2 3-2 3"/>'),
+  link: svg('<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/>'),
+  today: svg('<rect x="4" y="5" width="16" height="15" rx="2"/><path d="M4 10h16M9 3v4M15 3v4"/><circle cx="12" cy="15" r="1.6" fill="currentColor"/>')
 };
 function mapButton(host, label, icon, fn, text){
   const b = document.createElement('button');
@@ -1128,6 +1180,7 @@ function mapButton(host, label, icon, fn, text){
   b.addEventListener('click', fn); host.append(b);
   return b;
 }
+const btnLoc = mapButton($('locctl'), '내 위치', IC.locate, () => locTap());
 mapButton($('zoomctl'), '확대', IC.plus, () => zoomAt(null, null, 0.6));
 mapButton($('zoomctl'), '축소', IC.minus, () => zoomAt(null, null, 1 / 0.6));
 mapButton($('zoomctl'), '북쪽을 위로', IC.compass, () => { setOrbit(false); wrapAz(); goal.az = 0; });
@@ -1292,11 +1345,13 @@ function rebuildScene(){
       const stem = new THREE.Mesh(stemGeo, new THREE.MeshBasicMaterial({color: col}));
       const dot = new THREE.Mesh(dotGeo, dotMat);
       stem.position.copy(pos); dot.position.copy(pos); pinGroup.add(stem, dot);
-      const nm = h('span', {class: 'nm'}, s.name);
-      const el = h('button', {class: 'pin', type: 'button', tabIndex: -1, style: '--c:' + col,
-        onclick: () => selectStop(d, i, true)}, h('span', {class: 'num'}, String(i + 1)), nm);
+      const nm = h('span', {class: 'nm'}, s.name), ph = photosOf(s)[0];
+      // a stop with photos shows the first one on its pin
+      const img = ph ? h('img', {class: 'ph', src: ph.url, alt: '', decoding: 'async'}) : null;
+      const el = h('button', {class: 'pin' + (img ? ' has-ph' : ''), type: 'button', tabIndex: -1, style: '--c:' + col,
+        onclick: () => selectStop(d, i, true)}, h('span', {class: 'num'}, String(i + 1)), img, nm);
       labelsEl.append(el);
-      pins.push({d, i, pos, stem, dot, el, w: nm.offsetWidth + 18, anchor: new THREE.Vector3()});
+      pins.push({d, i, pos, stem, dot, el, w: nm.offsetWidth + 18 + (img ? 30 : 0), anchor: new THREE.Vector3()});
     });
     // the day's route: each leg densified so it can be draped on the terrain
     const L = [];
@@ -1434,6 +1489,7 @@ function updateOverlay(){
     }
   }
   if (mover.visible) mover.scale.setScalar(MODEL_PX[moverMode] * camera.position.distanceTo(mover.position) * pxScale);
+  placeMe(W, H);
   compassIcon.style.transform = 'rotate(' + cam.az.toFixed(3) + 'rad)';
   btn3d.setAttribute('aria-pressed', String(cam.pol > 0.3));
   const kmPerPx = cam.dist * pxScale; let km = SCALE_STEPS[0];
@@ -1519,22 +1575,32 @@ const canPlayDay = d => daySegments(d).length > 0;
 // Between two days the mover rests at the day's last stop (DAY_REST), then the view glides over to the next day's
 // first stop and waits there (DAY_FLY) before setting off, so the change of day can be followed.
 const DAY_REST = 1.0, DAY_FLY = 1.6;
+// A stop with photos holds the mover a little longer and shows them, one after another (at most PHOTO_MAX).
+const PHOTO_SEC = 1.7, PHOTO_MAX = 4;
+const photoSec = (d, i) => { const s = i != null && trip.days[d] && trip.days[d].stops[i]; const n = s ? photosOf(s).length : 0; return n ? 0.4 + Math.min(n, PHOTO_MAX) * PHOTO_SEC : 0; };
 function buildTimeline(days){
   const segs = [], dayAt = [];
   let t = 0;
   for (const d of days) {
     const ds = daySegments(d);
     if (!ds.length) continue;
-    if (segs.length) { const p = segs[segs.length - 1]; p.tail = DAY_REST; t += DAY_REST; }
+    if (segs.length) { const p = segs[segs.length - 1]; p.tail += DAY_REST; t += DAY_REST; }
     dayAt.push({d, t});
     let mark = 0;
     ds.forEach((s, k) => {
       s.d = d; s.mark = mark; s.tail = 0; s.dayStart = k === 0 && segs.length > 0;
       s.hold = k === 0 ? (segs.length ? DAY_FLY : 0.6) : ds[k - 1].after != null ? 0.8 : 0;
+      // the stop this segment waits at before setting off: its photos fill the end of the wait
+      const at = k === 0 ? (s.from >= 0 ? s.from : null) : ds[k - 1].after, ps = photoSec(d, at);
+      s.photo = ps ? {d, i: at, sec: ps} : null; s.hold += ps;
       s.t0 = t; s.dur = s.len / s.speed; t += s.hold + s.dur;
       if (s.after != null) mark = s.after;
       segs.push(s);
     });
+    // the day's last stop has no segment leaving it: its photos come after the arrival
+    const last = ds[ds.length - 1], ps = last.after != null ? photoSec(d, last.after) : 0;
+    last.tailPhoto = ps ? {d, i: last.after, sec: ps} : null;
+    last.tail += ps; t += ps;
   }
   return {segs, dayAt, T: t};
 }
@@ -1584,6 +1650,10 @@ function setPlayTime(t){
   P.s = clamp(u / seg.dur, 0, 1) * seg.len;
   placeMover(seg, P.s, u > 0 && !arrived && !P.paused);
   playHud(seg, arrived && seg.tail > 0 ? 'rest' : P.glide ? 'fly' : '');
+  let ph = null;
+  if (seg.photo && u < 0 && u >= -seg.photo.sec) ph = {at: seg.photo, f: (u + seg.photo.sec) / seg.photo.sec};
+  else if (seg.tailPhoto && arrived && u - seg.dur < seg.tailPhoto.sec) ph = {at: seg.tailPhoto, f: (u - seg.dur) / seg.tailPhoto.sec};
+  playPhoto(ph);
 }
 // walks and flights get their own close / wide view; the road view comes back afterwards
 function enterSeg(seg){
@@ -1599,6 +1669,7 @@ function pausePlay(p){ if (play) { play.paused = p; playUi(); } }
 function stopPlay(){
   const back = play && play.prevSnap;
   play = null; scrub = null; mover.visible = false; $('hud').hidden = true;
+  playPhoto(null);
   document.body.classList.remove('playing');
   if (snap === 'mini' && back && back !== 'mini' && !view && !state.pick) setSnap('peek');   // the list comes back as it was
   playUi(); updatePlaceCard(); dirty = true;
@@ -1986,35 +2057,43 @@ let navArmed = false, navBack = false;
 function navOpen(){ if (!navArmed && !navBack) { history.pushState({jejumap: 1}, ''); navArmed = true; } }
 function navClose(){ if (navArmed && !navBack) { navBack = true; history.back(); } }
 addEventListener('popstate', () => {
-  if (navBack) { navBack = false; navArmed = false; if (view || state.pick || askCb) navOpen(); return; }
+  if (navBack) { navBack = false; navArmed = false; if (view || state.pick || askCb || vw) navOpen(); return; }
   navArmed = false;
-  if (askCb) { closeAsk(false, true); if (view || state.pick) navOpen(); return; }     // back = 취소
+  if (askCb) { closeAsk(false, true); if (view || state.pick || vw) navOpen(); return; }     // back = 취소
+  if (vw) { closeViewer(true); if (view || state.pick) navOpen(); return; }
   if (state.pick) { const p = state.pick; endPick(); if (p.mode === 'move') openStop(p.d, p.i); }
   else if (view) closeView();
 });
 /* ---- a small confirm dialog (삭제 / 취소) ---- */
 // Focus starts on 취소, Tab stays inside, Esc / back / a tap outside cancel. It takes the history entry only when
 // nothing else holds one, so closing it never closes the view underneath.
-let askCb = null, askNav = false, askReturn = null;
-function ask(title, body, yes, cb){
+// alt = {label, fn}: a second choice (the dialog then stacks its buttons: yes, alt, 취소)
+let askCb = null, askAlt = null, askNav = false, askReturn = null;
+function ask(title, body, yes, cb, alt){
   askReturn = document.activeElement;
   $('askTitle').textContent = title; $('askBody').textContent = body; $('askYes').textContent = yes;
-  askCb = cb; askNav = !navArmed; navOpen();
+  $('askAlt').hidden = !alt; $('askAlt').textContent = alt ? alt.label : '';
+  $('ask').classList.toggle('stack', !!alt);
+  askCb = cb; askAlt = alt ? alt.fn : null; askNav = !navArmed; navOpen();
   $('ask').hidden = false; $('askNo').focus();
 }
 function closeAsk(ok, fromHistory){
   if (!askCb) return;
-  const cb = askCb; askCb = null; $('ask').hidden = true;
+  const cb = askCb, alt = askAlt; askCb = askAlt = null; $('ask').hidden = true;
   if (!fromHistory && askNav) navClose();
-  if (ok) cb();
+  if (ok === 'alt') alt();
+  else if (ok) cb();
   else if (askReturn && askReturn.isConnected) askReturn.focus({preventScroll: true});
 }
 $('askYes').addEventListener('click', () => closeAsk(true));
+$('askAlt').addEventListener('click', () => closeAsk('alt'));
 $('askNo').addEventListener('click', () => closeAsk(false));
 $('ask').addEventListener('click', e => { if (e.target === $('ask')) closeAsk(false); });
 $('ask').addEventListener('keydown', e => {
   if (e.key !== 'Tab') return;
-  e.preventDefault(); (document.activeElement === $('askNo') ? $('askYes') : $('askNo')).focus();
+  e.preventDefault();
+  const bs = [...$('ask').querySelectorAll('button:not([hidden])')], k = bs.indexOf(document.activeElement);
+  bs[(k + (e.shiftKey ? bs.length - 1 : 1)) % bs.length].focus();
 });
 function askRemove(d, i){
   const s = trip.days[d] && trip.days[d].stops[i];
@@ -2046,7 +2125,9 @@ const fid = () => 'f' + (++uid);
 
 function addPlace(p, d, thenEdit){
   const day = trip.days[d];
-  day.stops.push({name: String(p.name).slice(0, 60), lat: +(+p.lat).toFixed(5), lon: +(+p.lon).toFixed(5), time: '', memo: ''});
+  const used = new Set(trip.days.flatMap(x => x.stops.map(s => s.id)));
+  let id; do id = newId(); while (used.has(id));
+  day.stops.push({id, name: String(p.name).slice(0, 60), lat: +(+p.lat).toFixed(5), lon: +(+p.lon).toFixed(5), time: '', stay: null, memo: ''});
   const i = day.stops.length - 1;
   state.day = d; state.sel = {d, i};
   closeView(true); commit();
@@ -2150,12 +2231,27 @@ function openStop(d, i){
       day.stops.splice(i, 1); trip.days[nd].stops.push(s); state.day = nd; state.sel = {d: nd, i: trip.days[nd].stops.length - 1};
       commit(); openStop(nd, trip.days[nd].stops.length - 1); toast((nd + 1) + '일차 마지막으로 옮겼습니다.');
     }}, trip.days.map((_, k) => h('option', {value: k, selected: k === d}, (k + 1) + '일차' + (fmtShort(k) ? ' (' + fmtShort(k) + ')' : ''))));
+    // the arrival estimate under the times, kept up to date as the time or the stay changes
+    const etaP = h('p', {class: 'hint', style: 'margin:-8px 0 16px', 'aria-live': 'polite'});
+    const etaText = () => {
+      const p = dayPlan(d)[i];
+      etaP.textContent = !p ? '' : i === 0 ? '이 날 첫 장소입니다. ' + (s.time ? s.time + '부터' : '시간이 없으면 9시부터') + ' 다음 장소들의 도착 시각을 계산합니다.'
+        : '예상 도착 ~' + clock(p.eta) + ' (앞 장소에서 머무는 시간과 이동 시간으로 계산)' + (p.late > 10 ? ' · 넣은 시간보다 약 ' + fmtMin(p.late) + ' 늦을 것 같습니다.' : '');
+      etaP.classList.toggle('warn', !!p && p.late > 10);
+    };
+    const STAYS = [15, 30, 45, 60, 90, 120, 150, 180, 240, 300, 360, 480];
+    const stay = h('select', {class: 'in', id: fid(), onchange: e => { s.stay = e.target.value === '' ? null : +e.target.value; commit(true); etaText(); }},
+      h('option', {value: '', selected: s.stay == null}, '기본 ' + fmtMin(defaultStay(s))),
+      STAYS.map(m => h('option', {value: m, selected: s.stay === m}, fmtMin(m))),
+      s.stay != null && !STAYS.includes(s.stay) ? h('option', {value: s.stay, selected: true}, fmtMin(s.stay)) : null);
     put(v, vhead((d + 1) + '일차 장소 고치기', null, h('span', {class: 'n', style: '--c:' + dayColor(d)}, String(i + 1))),
       field('이름', h('input', {class: 'in', id: fid(), value: s.name, maxLength: 60, onchange: upd('name', 60)})),
       h('div', {class: 'row2'},
-        field('도착 시간', h('input', {class: 'in', id: fid(), type: 'time', value: s.time, onchange: upd('time', 5)})),
-        ferryNext ? field('배 출발 시각', h('input', {class: 'in', id: fid(), type: 'time', value: s.dep || '', onchange: upd('dep', 5)})) : h('span')),
-      ferryNext ? h('p', {class: 'hint', style: 'margin:-8px 0 16px'}, '다음 장소까지 바다를 건너 배편으로 계산했습니다. 출발 시각을 넣으면 구간에 시간표가 나옵니다.') : null,
+        field('도착 시간', h('input', {class: 'in', id: fid(), type: 'time', value: s.time, onchange: e => { upd('time', 5)(e); etaText(); }})),
+        field('머무는 시간', stay)),
+      etaP,
+      ferryNext ? field('배 출발 시각', h('input', {class: 'in', id: fid(), type: 'time', value: s.dep || '', style: 'max-width:50%', onchange: e => { upd('dep', 5)(e); etaText(); }}),
+        '다음 장소까지 바다를 건너 배편으로 계산했습니다. 출발 시각을 넣으면 구간에 시간표가 나옵니다.') : null,
       field('메모', h('textarea', {class: 'in', id: fid(), maxLength: 200, placeholder: '예: 점심, 예약 12시, 입장료 확인', onchange: upd('memo', 200)}, s.memo)),
       h('label', {class: 'switch'}, h('span', null, h('b', null, '걸어서 둘러보기'), h('span', {class: 'hint'}, '이 장소 주변 산책로를 걷는 동선을 지도와 재생에 넣습니다.')),
         h('input', {type: 'checkbox', checked: !!s.stroll, onchange: e => {
@@ -2165,6 +2261,8 @@ function openStop(d, i){
             toast(w ? '주변 길 ' + fmtKm(w.km) + '를 한 바퀴 걷는 동선을 넣었습니다.' : '이 장소 주변에는 지도에 걷는 길이 없어 둘러보기를 그리지 못했습니다.');
           }
         }})),
+      h('h3', {class: 'group-h'}, '사진'),
+      photoGroup(d, i),
       h('h3', {class: 'group-h'}, '순서와 날짜'),
       h('div', {class: 'group'},
         h('div', {class: 'row2'},
@@ -2176,10 +2274,13 @@ function openStop(d, i){
         h('p', {class: 'hint'}, areaOf(s.lat, s.lon) + ' · ' + s.lat.toFixed(5) + ', ' + s.lon.toFixed(5)),
         h('button', {class: 'btn', type: 'button', html: IC.search + '<span>장소·주소 검색으로 다시 찾기</span>', onclick: () => openSearch(d, {d, i})}),
         h('button', {class: 'btn', type: 'button', html: IC.target + '<span>지도에서 위치 다시 정하기</span>', onclick: () => startPick({mode: 'move', d, i})})),
-      h('h3', {class: 'group-h'}, '동선 재생'),
+      h('h3', {class: 'group-h'}, '길안내와 동선 재생'),
       h('div', {class: 'group'},
+        h('button', {class: 'btn', type: 'button', html: IC.nav + '<span>내 위치에서 여기까지 길안내</span>', onclick: () => openNav(null, s, modeOf(s))}),
+        i > 0 ? h('button', {class: 'btn', type: 'button', html: IC.nav + '<span>앞 장소에서 여기까지 길안내</span>', onclick: () => openNav(day.stops[i - 1], s, modeOf(s))}) : null,
         h('button', {class: 'btn', type: 'button', html: IC.play + '<span>여기부터 동선 재생</span>', onclick: () => { closeView(); startPlay({stop: {d, i}}); }})),
       h('button', {class: 'btn danger wide', type: 'button', style: 'margin-top:8px', html: IC.trash + '<span>이 장소 삭제</span>', onclick: () => askRemove(d, i)}));
+    etaText();
   });
 }
 // a stop gets a new name and position from a search result; 되돌리기 puts the old ones back
@@ -2206,6 +2307,10 @@ function openDay(d){
       field('이 날의 제목', h('input', {class: 'in', id: fid(), value: day.title, maxLength: 60, placeholder: '예: 서귀포 남쪽 해안', onchange: e => { day.title = e.target.value.trim(); commit(true); }})),
       field('메모', h('textarea', {class: 'in', id: fid(), maxLength: 200, placeholder: '예: 비 오면 실내 일정으로', onchange: e => { day.note = e.target.value.trim(); commit(true); }}, day.note)),
       trip.startDate ? null : h('p', {class: 'hint', style: 'margin-bottom:16px'}, '여행 시작일을 넣으면 일차마다 날짜와 요일이 붙습니다. ', h('button', {class: 'link', type: 'button', onclick: openTrip}, '시작일 넣기')),
+      h('div', {class: 'group'},
+        day.stops.length > 2 ? h('button', {class: 'btn', type: 'button', html: IC.sort + '<span>동선 자동 정리</span>', onclick: () => openOrder(d)}) : null,
+        h('button', {class: 'btn', type: 'button', html: IC.today + '<span>이 날을 오늘 일정으로 보기</span>', onclick: () => { closeView(true); setToday(true, d); }}),
+        h('p', {class: 'hint'}, '오늘 일정으로 보면 다음 장소까지 거리와 도착 예상을 보여 주고, 장소마다 도착 체크를 할 수 있습니다. 여행 날짜에는 저절로 켜집니다.')),
       trip.days.length > 1 ? h('button', {class: 'btn danger wide', type: 'button', html: IC.trash + '<span>이 날 빼기</span>', onclick: () => {
         const gone = trip.days.splice(d, 1)[0]; state.day = Math.min(d, trip.days.length - 1); state.sel = null; closeView(true); commit();
         toast((d + 1) + '일차(장소 ' + gone.stops.length + '곳)를 뺐습니다.', '되돌리기', () => { trip.days.splice(d, 0, gone); state.day = d; commit(); });
@@ -2257,6 +2362,7 @@ function importTrip(){
   f.click();
 }
 function openTrip(){
+  if (countStops(trip)) makeLink().catch(() => {});          // ready before 링크로 일정 보내기 is tapped
   openView('trip', v => {
     const exag = h('input', {type: 'range', min: 1, max: 4, step: 0.1, value: state.exag}), ev = h('span', null, '×' + state.exag.toFixed(1));
     exag.addEventListener('input', () => {
@@ -2275,11 +2381,17 @@ function openTrip(){
       h('label', {class: 'switch', style: 'margin-bottom:16px'}, h('span', null, h('b', null, '비행기로 오가기'),
           h('span', {class: 'hint'}, '첫 장소 앞에 제주공항 도착을, 마지막 장소 뒤에 제주공항 출발을 넣습니다. 동선 재생은 비행기로 시작하고 끝납니다.')),
         h('input', {type: 'checkbox', checked: trip.air, onchange: e => { trip.air = e.target.checked; commit(true); }})),
-      h('h3', {class: 'group-h'}, '일정 파일'),
+      h('h3', {class: 'group-h'}, '일정 보내기·받기'),
       h('div', {class: 'group'},
+        h('button', {class: 'btn primary', type: 'button', html: IC.link + '<span>링크로 일정 보내기</span>', onclick: shareTrip}),
+        h('button', {class: 'btn', type: 'button', html: IC.open + '<span>받은 링크로 일정 열기</span>', onclick: openPaste}),
+        h('p', {class: 'hint'}, '링크 하나에 일정이 모두 담겨, 카카오톡으로 보내면 받은 사람이 눌러서 바로 엽니다. 일정은 링크 안에만 들어 있고 어느 서버에도 올라가지 않습니다. 사진과 도착 체크는 보내지 않습니다.'),
+        store.get(BEFORE_KEY) ? h('button', {class: 'btn', type: 'button', onclick: restoreBefore}, '링크 받기 전 일정 다시 열기') : null,
         h('button', {class: 'btn', type: 'button', html: IC.share + '<span>일정 파일 내보내기·공유</span>', onclick: exportTrip}),
         h('button', {class: 'btn', type: 'button', html: IC.open + '<span>일정 파일 가져오기</span>', onclick: importTrip}),
-        h('p', {class: 'hint'}, '일정은 이 기기의 브라우저에만 저장되고, 앱이 새 버전으로 바뀌어도 그대로 남습니다. 다른 기기나 동행에게는 파일로 보내 주세요.')),
+        h('p', {class: 'hint'}, '일정은 이 기기의 브라우저에만 저장되고, 앱이 새 버전으로 바뀌어도 그대로 남습니다.')),
+      h('h3', {class: 'group-h'}, '사진'),
+      photoStats(),
       h('h3', {class: 'group-h'}, '새로 시작'),
       h('div', {class: 'group'},
         h('button', {class: 'btn', type: 'button', onclick: loadExample}, '예시 일정 불러오기 (2박 3일)'),
@@ -2360,6 +2472,7 @@ function mapClick(e){
 
 /* ---- selection ---- */
 function flyTo(s){
+  if (me.follow) setFollow(false);
   goal.tx = toX(s.lon); goal.tz = toZ(s.lat);
   if (goal.dist > 4 || orbit) goal.dist = 1.8;      // close enough to see the streets and buildings around the stop
 }
@@ -2400,8 +2513,8 @@ function renderHead(animate){
   title.textContent = tripHead ? trip.title : (trip.days[d].title || (d + 1) + '일차');
   title.insertAdjacentHTML('beforeend', IC.edit);
   $('titleBtn').setAttribute('aria-label', tripHead ? '여행 이름과 날짜 고치기' : (d + 1) + '일차 제목과 메모 고치기');
-  $('dayMeta').textContent = !tripHead ? [(d + 1) + '일차', fmtDate(d), dayTotal(d)].filter(Boolean).join(' · ')
-    : n === 1 ? [a ? fmtDate(0) : '날짜 미정 · 제목을 눌러 정하기', dayTotal(0) || cnt + '곳'].join(' · ')
+  $('dayMeta').textContent = !tripHead ? [(d + 1) + '일차', fmtDate(d), dayTotal(d), dayEnd(d)].filter(Boolean).join(' · ')
+    : n === 1 ? [a ? fmtDate(0) : '날짜 미정 · 제목을 눌러 정하기', dayTotal(0) || cnt + '곳', dayEnd(0)].filter(Boolean).join(' · ')
     : [a ? (a.getMonth() + 1) + '월 ' + a.getDate() + '일부터' : '', n + '일', cnt + '곳'].filter(Boolean).join(' · ');
   const note = d >= 0 ? trip.days[d].note : '';
   $('dayNote').hidden = !note; $('dayNote').textContent = note;
@@ -2413,21 +2526,26 @@ function renderChips(){
   box.textContent = '';
   const chip = (d, label, sub) => h('button', {class: 'chip', type: 'button', role: 'tab', 'aria-selected': String(state.day === d),
     style: d >= 0 ? '--c:' + dayColor(d) : null, onclick: () => selectDay(d)}, h('b', null, label), sub ? h('small', null, sub) : null);
+  updateDock();
   if (n > 1) box.append(chip(-1, '전체', n + '일'));
-  trip.days.forEach((x, d) => box.append(chip(d, (d + 1) + '일차', fmtShort(d) || x.stops.length + '곳')));
+  const td = todayIndex();
+  trip.days.forEach((x, d) => box.append(chip(d, (d + 1) + '일차', d === td ? '오늘' : fmtShort(d) || x.stops.length + '곳')));
   box.append(h('button', {class: 'chip add', type: 'button', 'aria-label': '하루 더하기', html: IC.plus, onclick: addDay}));
   const cur = box.querySelector('[aria-selected="true"]');
   if (cur) cur.scrollIntoView({block: 'nearest', inline: 'nearest'});
 }
 function renderPeek(){
   const pk = $('peek'), s = state.sel && trip.days[state.sel.d] && trip.days[state.sel.d].stops[state.sel.i];
-  pk.textContent = '';
+  pk.textContent = ''; pk.classList.remove('today');
+  if (!s && !play && todayOn() && state.day === state.todayDay) return renderTodayPeek(pk);
   if (s) {
-    const {d, i} = state.sel;
+    const {d, i} = state.sel, onDay = todayOn() && state.todayDay === d;
     pk.style.setProperty('--c', dayColor(d));
     put(pk, h('span', {class: 'n'}, String(i + 1)),
       h('span', {class: 'p-txt'}, h('span', {class: 'p-main'}, s.name), h('span', {class: 'p-sub'}, [(d + 1) + '일차', s.time, s.memo].filter(Boolean).join(' · '))),
-      play ? null : h('button', {class: 'icon-btn', type: 'button', html: IC.play, 'aria-label': s.name + '부터 동선 재생', title: '여기부터 동선 재생',
+      play ? null : onDay ? h('button', {class: 'icon-btn', type: 'button', html: IC.nav, 'aria-label': s.name + '까지 길안내', title: '길안내',
+        onclick: () => openNav(null, s, modeOf(s))})
+      : h('button', {class: 'icon-btn', type: 'button', html: IC.play, 'aria-label': s.name + '부터 동선 재생', title: '여기부터 동선 재생',
         onclick: () => startPlay({stop: {d, i}})}),
       h('button', {class: 'btn sm', type: 'button', html: IC.edit + '<span>고치기</span>', onclick: () => openStop(d, i)}));
     return;
@@ -2465,7 +2583,8 @@ function legRow(d, i, l, a, b){
     wrap.append(h('div', {class: 'leg-pick', role: 'radiogroup', 'aria-label': (i + 1) + '번에서 ' + (i + 2) + '번까지 이동수단'},
       MODES.map(m => h('button', {class: 'seg', type: 'button', role: 'radio', 'aria-checked': String(cur === m.id), html: m.icon + '<span>' + m.label + '</span>',
         onclick: () => { setMode(b, m.id); legOpen = null; commit(); }})),
-      h('p', {class: 'leg-hint'}, '시간은 도로망으로 낸 추정값입니다. 버스는 정류장과 기다림을 더해 길게, 도보는 시속 4.5km로 잡습니다.')));
+      h('p', {class: 'leg-hint'}, '시간은 도로망으로 낸 추정값입니다. 버스는 정류장과 기다림을 더해 길게, 도보는 시속 4.5km로 잡습니다.')),
+      h('button', {class: 'btn sm leg-nav', type: 'button', html: IC.nav + '<span>이 구간 길안내 (카카오맵·네이버지도)</span>', onclick: () => openNav(a, b, modeOf(b))}));
   }
   return wrap;
 }
@@ -2477,7 +2596,7 @@ function daySection(d){
         canPlayDay(d) ? h('button', {class: 'icon-btn', type: 'button', html: IC.play, 'aria-label': (d + 1) + '일차부터 동선 재생', title: '이 날부터 동선 재생',
           onclick: () => startPlay({days: trip.days.map((_, k) => k), day: d})}) : null,
         h('button', {class: 'btn sm', type: 'button', onclick: () => openDay(d)}, '고치기'))),
-    h('p', {class: 'day-h-meta'}, [fmtDate(d), dayTotal(d)].filter(Boolean).join(' · ') || (day.stops.length ? day.stops.length + '곳' : '아직 장소가 없습니다')));
+    h('p', {class: 'day-h-meta'}, [fmtDate(d), dayTotal(d), dayEnd(d)].filter(Boolean).join(' · ') || (day.stops.length ? day.stops.length + '곳' : '아직 장소가 없습니다')));
   if (!day.stops.length) {
     if (!all) sec.append(h('div', {class: 'empty'}, h('p', null, '이 날은 아직 장소가 없습니다. 아래 ‘장소 추가’로 넣어 보세요.')));
     return sec;
@@ -2492,17 +2611,26 @@ function daySection(d){
         'aria-label': text.filter(Boolean).join(', ') + '. 비행기 오가기 설정 열기', onclick: openTrip}));
   };
   if (A && A.d0 === d && A.inOn && !day.stops[0].airIn) sec.append(airRow(true, A.inLeg));
+  const plan = dayPlan(d), todayHere = todayOn() && state.todayDay === d;
   day.stops.forEach((s, i) => {
-    const cur = !!state.sel && state.sel.d === d && state.sel.i === i;
+    const cur = !!state.sel && state.sel.d === d && state.sel.i === i, pl = plan[i], np = photosOf(s).length;
     const li = h('li', {'data-i': i});
-    const handle = h('span', {class: 'handle', html: IC.grip, title: '끌어서 순서 바꾸기', 'aria-hidden': 'true'});
-    handle.addEventListener('pointerdown', e => sortStart(e, d, li, handle));
-    put(li, h('div', {class: 'card', 'data-k': d + '-' + i, 'aria-current': cur ? 'true' : null}, handle,
+    // on the day itself the drag handle gives its place to an arrival check
+    let lead;
+    if (todayHere) lead = h('button', {class: 'check', type: 'button', role: 'checkbox', 'aria-checked': String(s.done), html: IC.check,
+      'aria-label': s.name + ' 도착 체크', title: s.done ? '도착 체크 풀기' : '도착 체크', onclick: () => checkIn(d, i, !s.done)});
+    else {
+      lead = h('span', {class: 'handle', html: IC.grip, title: '끌어서 순서 바꾸기', 'aria-hidden': 'true'});
+      lead.addEventListener('pointerdown', e => sortStart(e, d, li, lead));
+    }
+    const memo = [s.done && todayHere ? (s.doneAt ? s.doneAt + ' 도착' : '도착') : '', s.stroll ? '걸어서 둘러보기' : '', np ? '사진 ' + np + '장' : '', s.memo].filter(Boolean).join(' · ');
+    const late = pl && pl.late > 10 && !(todayHere && s.done) ? h('span', {class: 's-late'}, '넣은 시간보다 약 ' + fmtMin(pl.late) + ' 늦게 도착할 것 같아요') : null;
+    put(li, h('div', {class: 'card' + (todayHere && s.done ? ' done' : ''), 'data-k': d + '-' + i, 'aria-current': cur ? 'true' : null}, lead,
         h('button', {class: 'card-main', type: 'button', onclick: () => selectStop(d, i, true)},
           h('span', {class: 'n'}, String(i + 1)),
-          h('span', {class: 's-main'}, h('span', {class: 's-name'}, s.name),
-            s.memo || s.stroll ? h('span', {class: 's-memo'}, [s.stroll ? '걸어서 둘러보기' : '', s.memo].filter(Boolean).join(' · ')) : null),
-          s.time ? h('span', {class: 's-time'}, timeText(s)) : null),
+          h('span', {class: 's-main'}, h('span', {class: 's-name'}, s.name), memo ? h('span', {class: 's-memo'}, memo) : null, late),
+          s.time ? h('span', {class: 's-time'}, timeText(s))
+            : i > 0 && pl ? h('span', {class: 's-time eta', title: '예상 도착 시각'}, '~' + clock(pl.eta)) : null),
         h('button', {class: 'icon-btn', type: 'button', html: IC.edit, 'aria-label': s.name + ' 고치기', title: '고치기', onclick: () => openStop(d, i)}),
         h('button', {class: 'icon-btn del', type: 'button', html: IC.trash, 'aria-label': s.name + ' 삭제', title: '삭제', onclick: () => askRemove(d, i)})),
       L[i] ? legRow(d, i, L[i], s, day.stops[i + 1]) : null);
@@ -2511,6 +2639,9 @@ function daySection(d){
   sec.append(ol);
   const last = day.stops[day.stops.length - 1];
   if (A && A.d1 === d && A.outOn && !last.airOut) sec.append(airRow(false, A.outLeg));
+  if (day.stops.length > 1) sec.append(h('div', {class: 'day-tools'},
+    day.stops.length > 2 ? h('button', {class: 'btn sm', type: 'button', html: IC.sort + '<span>동선 자동 정리</span>', onclick: () => openOrder(d)}) : null,
+    h('p', {class: 'hint'}, '~ 시각은 ' + (day.stops[0].time ? day.stops[0].time : '9시') + ' 출발에 이동 시간과 머무는 시간을 더한 예상 도착입니다.')));
   return sec;
 }
 function renderPanel(animate){
@@ -2576,6 +2707,644 @@ function sortEnd(e){
   toast('순서를 바꿨습니다. 길을 다시 그렸습니다.');
 }
 
+/* ================= arrival estimates ================= */
+// Each stop's arrival: the first stop's time (or 9:00), then the drive from the stop before plus the time spent there.
+// A stop with its own time waits for it when early; arriving later than that time is a delay worth showing.
+const clock = m => { m = ((Math.round(m) % 1440) + 1440) % 1440; return String(Math.floor(m / 60)).padStart(2, '0') + ':' + String(m % 60).padStart(2, '0'); };
+const nowMin = () => { const t = new Date(); return t.getHours() * 60 + t.getMinutes() + t.getSeconds() / 60; };
+const STAY_BY = [[/공항|여객터미널|항구|렌터카|주유소|충전소|주차장|버스터미널|안내소|편의점|마트|약국|은행|ATM|우체국|화장실|숙소|캠핑장/, 30],
+  [/테마파크|박물관|미술관|동물원|아쿠아리움/, 120], [/오름·봉우리|동굴|숲|계곡/, 90]];
+const stayCache = new Map();
+function defaultStay(s){                  // minutes, by the kind of place found at the stop
+  if (/공항|렌터카|터미널/.test(s.name)) return 30;
+  const k = s.lat.toFixed(4) + ',' + s.lon.toFixed(4);
+  if (!stayCache.has(k)) {
+    const p = nearestPlace(s.lat, s.lon, 0.12), c = p ? CATS[p.cat] : '';
+    let m = 60; for (const [re, v] of STAY_BY) if (re.test(c)) { m = v; break; }
+    stayCache.set(k, m);
+  }
+  return stayCache.get(k);
+}
+const stayOf = s => s.stay != null ? s.stay : defaultStay(s);
+function dayPlan(d){
+  const st = trip.days[d] ? trip.days[d].stops : [], L = legs[d] || [], out = [];
+  let t = 0;
+  st.forEach((s, i) => {
+    let eta = s.time ? toMin(s.time) : 540;
+    if (i > 0) {
+      const l = L[i - 1];
+      let m = l ? legMin(l, s) : 0;
+      if (m == null) m = l.kind === 'ferry' ? l.km / 25 * 60 + 10 : l.km / 30 * 60;   // a crossing: about 25 km/h and boarding
+      eta = t + m;
+    }
+    const plan = s.time ? toMin(s.time) : null, late = plan != null && i > 0 ? Math.round(eta - plan) : 0;
+    const arr = plan != null ? Math.max(eta, plan) : eta;
+    t = s.dep ? Math.max(arr, toMin(s.dep)) : arr + stayOf(s);
+    out.push({eta, arr, late});
+  });
+  return out;
+}
+const dayEnd = d => { const st = trip.days[d] ? trip.days[d].stops : []; if (st.length < 2) return ''; const p = dayPlan(d); return '마지막 도착 ~' + clock(p[p.length - 1].arr); };
+function saveTrip(){ if (!store.set(TRIP_KEY, JSON.stringify(trip))) toast('이 브라우저에 일정을 저장하지 못했습니다. 개인정보 보호 모드인지 확인해 주세요.'); }
+const countStops = t => t.days.reduce((a, x) => a + x.stops.length, 0);
+
+/* ================= today: the day of the trip that is today ================= */
+// During the trip the app opens on today's day: the next stop sits in the peek line with the distance from the phone,
+// and each stop can be checked off on arrival. Without dates, a day can be picked as 'today' from its editor.
+function todayIndex(){
+  const a = dayDate(0);
+  if (!a) return -1;
+  const n = new Date(), k = Math.round((new Date(n.getFullYear(), n.getMonth(), n.getDate()) - a) / 864e5);
+  return k >= 0 && k < trip.days.length ? k : -1;
+}
+const todayOn = () => state.today && !!trip.days[state.todayDay];
+const btnToday = $('btnToday');
+function updateDock(){
+  btnToday.hidden = !todayOn() && todayIndex() < 0;
+  $('dock').classList.toggle('three', !btnToday.hidden);       // three buttons: tighter, so they fit a 360 px phone
+  btnToday.setAttribute('aria-pressed', String(todayOn()));
+  btnToday.setAttribute('aria-label', todayOn() ? '오늘 일정 보기 끄기' : '오늘 일정 보기');
+}
+function setToday(on, d){
+  if (on) {
+    state.today = true; state.todayDay = d != null ? d : Math.max(0, todayIndex());
+    state.day = state.todayDay; state.sel = null; legOpen = null;
+    if (play) stopPlay();
+    setOrbit(false); applyFilter(); renderPanel(true);
+    if (!isDesk() && snap !== 'half') setSnap('half');
+    if (me.fix) centerMe(); else fitStops(trip.days[state.day].stops);
+    if (me.watch == null && navigator.geolocation && window.isSecureContext) startLoc(false);
+  } else { state.today = false; renderPanel(); }
+  updateDock();
+}
+btnToday.innerHTML = IC.today + '<span>오늘</span>';
+btnToday.addEventListener('click', () => setToday(!todayOn()));
+function checkIn(d, i, on){
+  const s = trip.days[d] && trip.days[d].stops[i];
+  if (!s) return;
+  s.done = on; s.doneAt = on ? clock(nowMin()) : '';
+  saveTrip();
+  if (state.sel && state.sel.d === d && state.sel.i === i) state.sel = null;
+  me.route = null; renderPanel();
+  if (me.fix) meMoved();
+  if (!on) return;
+  const nx = trip.days[d].stops.find(x => !x.done);
+  toast('‘' + s.name + '’ 도착 체크했습니다.' + (nx ? ' 다음은 ‘' + nx.name + '’입니다.' : ' 오늘 일정을 모두 마쳤습니다.'), '되돌리기', () => checkIn(d, i, false));
+}
+function renderTodayPeek(pk){
+  const d = state.todayDay, st = trip.days[d].stops, k = st.findIndex(s => !s.done);
+  pk.classList.add('today'); pk.style.setProperty('--c', dayColor(d));
+  const badge = h('span', {class: 'p-badge'}, '오늘');
+  if (!st.length) return put(pk, badge, h('span', {class: 'p-txt'}, h('span', {class: 'p-main'}, '오늘 일정에 장소가 없습니다'), h('span', {class: 'p-sub'}, '‘장소 추가’로 넣어 보세요')));
+  if (k < 0) return put(pk, badge, h('span', {class: 'p-txt'}, h('span', {class: 'p-main'}, '오늘 일정을 모두 마쳤습니다'), h('span', {class: 'p-sub'}, st.length + '곳 모두 도착 체크 · 즐거운 하루였기를')));
+  const s = st[k];
+  badge.textContent = '다음';
+  put(pk, badge, h('span', {class: 'n'}, String(k + 1)),
+    h('span', {class: 'p-txt'}, h('span', {class: 'p-main'}, s.name), h('span', {class: 'p-sub', id: 'nextInfo'}, nextText(d, k))),
+    h('div', {class: 'p-act'},
+      h('button', {class: 'btn sm', type: 'button', html: IC.check + '<span>도착 체크</span>', 'aria-label': s.name + ' 도착 체크', onclick: () => checkIn(d, k, true)}),
+      h('button', {class: 'btn sm', type: 'button', html: IC.nav + '<span>길안내</span>', 'aria-label': s.name + '까지 길안내', onclick: () => openNav(null, s, modeOf(s))})));
+}
+function nextText(d, k){
+  const s = trip.days[d].stops[k], r = me.route;
+  if (me.fix && r && r.id === s.id) {
+    const l = r.leg, m = legMin(l, s), parts = ['여기서 ' + fmtKm(l.kind === 'road' ? l.km : hav(me.fix, s))];
+    if (m != null) {
+      const arr = nowMin() + m;
+      parts.push(MODES.find(x => x.id === modeOf(s)).label + ' 약 ' + fmtMin(m), clock(arr) + '쯤 도착');
+      if (s.time) { const late = Math.round(arr - toMin(s.time)); if (late > 10) parts.push('예정보다 ' + fmtMin(late) + ' 늦음'); else if (late < -10) parts.push('예정보다 ' + fmtMin(-late) + ' 일찍'); }
+    } else parts.push(l.kind === 'ferry' ? '배로 건너는 곳' : '도로로 이어지지 않음');
+    return parts.join(' · ');
+  }
+  if (me.watch != null && !me.fix) return '내 위치를 찾는 중…';
+  const p = dayPlan(d)[k];
+  return [s.time ? s.time + ' 도착 예정' : k > 0 && p ? '~' + clock(p.eta) + ' 도착 예상' : '', '내 위치를 켜면 남은 거리를 알려 드려요'].filter(Boolean).join(' · ');
+}
+function refreshNext(){
+  const el = $('nextInfo');
+  if (!el || !todayOn()) return;
+  const k = trip.days[state.todayDay].stops.findIndex(s => !s.done);
+  if (k >= 0) el.textContent = nextText(state.todayDay, k);
+}
+
+/* ================= my location ================= */
+// The phone's position as a dot on the map (with its accuracy ring). The first tap finds it and follows it; dragging
+// the map stops following; a tap while not following comes back to it; a tap while following turns it off.
+const me = {watch: null, fix: null, follow: false, want: false, el: null, out: false, route: null, near: new Set()};
+function locTap(){
+  if (!navigator.geolocation || !window.isSecureContext) return toast('이 브라우저에서는 위치를 쓸 수 없습니다.');
+  if (me.watch == null) return startLoc(true);
+  if (!me.fix) { me.want = true; return toast('내 위치를 찾는 중입니다…'); }
+  if (!me.follow) { setFollow(true); centerMe(); return; }
+  stopLoc(); toast('내 위치 표시를 껐습니다.');
+}
+function startLoc(center){
+  me.want = center; me.out = false;
+  btnLoc.classList.add('busy'); btnLoc.setAttribute('aria-pressed', 'true');
+  if (center) toast('내 위치를 찾는 중…', null, null, 2500);
+  try { me.watch = navigator.geolocation.watchPosition(onFix, onLocErr, {enableHighAccuracy: true, maximumAge: 10000, timeout: 30000}); }
+  catch (e) { me.watch = null; btnLoc.classList.remove('busy'); btnLoc.setAttribute('aria-pressed', 'false'); }
+}
+function stopLoc(){
+  if (me.watch != null) try { navigator.geolocation.clearWatch(me.watch); } catch (e) {}
+  me.watch = null; me.fix = null; me.route = null; me.want = false;
+  setFollow(false);
+  btnLoc.classList.remove('busy'); btnLoc.setAttribute('aria-pressed', 'false');
+  refreshNext(); dirty = true;
+}
+function onFix(p){
+  const c = p.coords;
+  btnLoc.classList.remove('busy');
+  if (!inBox(c.latitude, c.longitude)) {
+    if (!me.out) toast('지금 위치가 제주 밖이라 지도에 표시하지 않습니다. 제주에 도착한 뒤 다시 눌러 주세요.', null, null, 5000);
+    me.out = true; stopLoc(); return;
+  }
+  me.fix = {lat: c.latitude, lon: c.longitude, acc: c.accuracy || 50, t: Date.now()};
+  if (me.want) { me.want = false; setFollow(true); centerMe(); }
+  else if (me.follow && !(play && !play.paused)) { goal.tx = toX(me.fix.lon); goal.tz = toZ(me.fix.lat); }
+  dirty = true;
+  meMoved();
+}
+function onLocErr(e){
+  btnLoc.classList.remove('busy');
+  if (e.code === 1) { stopLoc(); toast('위치 권한이 꺼져 있습니다. 브라우저나 휴대폰 설정에서 이 사이트의 위치 사용을 허용해 주세요.', null, null, 6000); }
+  else if (!me.fix) toast('위치를 아직 찾지 못했습니다. 하늘이 트인 곳에서 잠시 기다려 주세요.');
+}
+function setFollow(on){
+  me.follow = on;
+  btnLoc.classList.toggle('follow', on);
+  btnLoc.setAttribute('aria-label', me.watch == null ? '내 위치' : on ? '내 위치 표시 끄기' : '내 위치로 가기');
+}
+function centerMe(){
+  if (!me.fix) return;
+  if (play) stopPlay();
+  setOrbit(false);
+  goal.tx = toX(me.fix.lon); goal.tz = toZ(me.fix.lat);
+  if (goal.dist > 6) goal.dist = 2.4;
+}
+function placeMe(W, H){
+  if (!me.fix) { if (me.el) me.el.hidden = true; return; }
+  if (!me.el) { me.el = h('div', {class: 'me'}, h('i', {class: 'acc'}), h('i', {class: 'dot'})); labelsEl.append(me.el); }
+  const x = toX(me.fix.lon), z = toZ(me.fix.lat);
+  tmp.set(x, groundY(x, z), z).project(camera);
+  const on = tmp.z < 1 && tmp.z > -1 && Math.abs(tmp.x) < 1.2 && Math.abs(tmp.y) < 1.2;
+  me.el.hidden = !on;
+  if (!on) return;
+  me.el.style.transform = 'translate(' + ((tmp.x * 0.5 + 0.5) * W).toFixed(1) + 'px,' + ((-tmp.y * 0.5 + 0.5) * H).toFixed(1) + 'px)';
+  me.el.style.setProperty('--acc', clamp(me.fix.acc / 500 / (cam.dist * pxScale), 0, 600).toFixed(0) + 'px');
+}
+// today: the drive from here to the next stop (again after 100 m, a new next stop, or 30 s), and an offer to check in
+function meMoved(){
+  if (!todayOn() || !me.fix) return;
+  const d = state.todayDay, st = trip.days[d].stops, k = st.findIndex(s => !s.done);
+  if (k < 0) return;
+  const s = st[k];
+  if (hav(me.fix, s) < 0.15 && me.fix.acc < 150 && !me.near.has(s.id)) {
+    me.near.add(s.id);
+    toast('‘' + s.name + '’ 근처에 왔습니다.', '도착 체크', () => checkIn(d, k, true), 12000);
+  }
+  const r = me.route, now = Date.now();
+  if (!r || r.id !== s.id || hav(r.from, me.fix) > 0.1 || now - r.t > 30000) {
+    const from = {lat: me.fix.lat, lon: me.fix.lon};
+    me.route = {id: s.id, from, t: now, leg: routeLeg(from, s, true)};
+  }
+  refreshNext();
+}
+
+/* ================= directions in Kakao Map / Naver Map ================= */
+// Kakao: its documented web links (map.kakao.com/link/by/{car|traffic|walk}/A/B, or /link/to/B from where the phone is);
+// they open the Kakao Map app when it is installed. Naver: its app scheme (nmap://route/{car|public|walk}), through an
+// Android intent that falls back to the Play Store, or on iPhone the App Store when the app does not answer.
+const UA = navigator.userAgent, IS_ANDROID = /Android/i.test(UA), IS_IOS = /iPhone|iPad|iPod/i.test(UA) || (/Macintosh/.test(UA) && navigator.maxTouchPoints > 1);
+const navNm = s => String(s.name || '목적지').replace(/[,/\\#?%]+/g, ' ').trim().slice(0, 40) || '목적지';
+const kakaoPt = s => encodeURIComponent(navNm(s)) + ',' + (+s.lat).toFixed(6) + ',' + (+s.lon).toFixed(6);
+function kakaoUrl(a, b, mode){
+  return a ? 'https://map.kakao.com/link/by/' + ({bus: 'traffic', walk: 'walk'}[mode] || 'car') + '/' + kakaoPt(a) + '/' + kakaoPt(b)
+    : 'https://map.kakao.com/link/to/' + kakaoPt(b);
+}
+function naverPath(a, b, mode){
+  const q = a ? {slat: (+a.lat).toFixed(6), slng: (+a.lon).toFixed(6), sname: navNm(a)} : {};
+  Object.assign(q, {dlat: (+b.lat).toFixed(6), dlng: (+b.lon).toFixed(6), dname: navNm(b), appname: location.origin + location.pathname});
+  return 'route/' + ({bus: 'public', walk: 'walk'}[mode] || 'car') + '?' + Object.keys(q).map(k => k + '=' + encodeURIComponent(q[k])).join('&');
+}
+function naverOpen(a, b, mode){
+  const path = naverPath(a, b, mode);
+  if (IS_ANDROID) location.href = 'intent://' + path + '#Intent;scheme=nmap;action=android.intent.action.VIEW;category=android.intent.category.BROWSABLE;package=com.nhn.android.nmap;end';
+  else if (IS_IOS) {
+    const t0 = Date.now();
+    location.href = 'nmap://' + path;
+    setTimeout(() => { if (!document.hidden && Date.now() - t0 < 2500) location.href = 'https://apps.apple.com/app/id311867728'; }, 1500);
+  } else toast('네이버지도 길안내는 휴대폰의 네이버지도 앱에서 열립니다. 컴퓨터에서는 카카오맵을 써 주세요.', null, null, 5000);
+}
+// a = null: from wherever the phone is (the map app finds it)
+function openNav(a, b, mode){
+  ask('어느 지도로 길안내를 열까요?', (a ? a.name : '내 위치') + ' → ' + b.name + ({bus: ' (대중교통)', walk: ' (도보)'}[mode] || ' (자동차)'),
+    '카카오맵', () => window.open(kakaoUrl(a, b, mode), '_blank', 'noopener'), {label: '네이버지도', fn: () => naverOpen(a, b, mode)});
+}
+
+/* ================= reordering a day (shortest drive) ================= */
+// All pairs of driving minutes (one Dijkstra per stop, a pause between them so the screen stays alive), then the best
+// order with the first stop fixed (and the last, if asked): exact for up to 13 stops, 2-opt and single moves beyond.
+async function costMatrix(stops, live){
+  const n = stops.length, M = [], K = [];
+  const sn = stops.map(s => { const x = toX(s.lon), z = toZ(s.lat), id = G ? snapNode(x, z) : -1; return {id, off: id >= 0 ? Math.hypot(G.x[id] - x, G.z[id] - z) : 0}; });
+  for (let i = 0; i < n; i++) {
+    await new Promise(r => setTimeout(r, 0));
+    if (live && !live()) return null;
+    const a = sn[i], tg = sn.map((b, j) => a.id >= 0 && j !== i && b.id >= 0 && G.comp[b.id] === G.comp[a.id] ? b.id : -1);
+    const ids = [...new Set(tg.filter(v => v >= 0))], res = ids.length ? roadFrom(a.id, ids) : [], got = new Map(ids.map((v, q) => [v, res[q]]));
+    M.push(new Float64Array(n)); K.push(new Float64Array(n));
+    for (let j = 0; j < n; j++) {
+      if (j === i) continue;
+      const r = tg[j] >= 0 ? got.get(tg[j]) : null, walk = a.off + sn[j].off;
+      if (r && isFinite(r.h)) { M[i][j] = (r.h + walk / 15) * 60 * 1.15; K[i][j] = r.km + walk; }
+      else { const km = hav(stops[i], stops[j]); K[i][j] = km; M[i][j] = km / 25 * 60 + 40; }   // a ferry or a gap in the roads
+    }
+  }
+  return {M, K};
+}
+const pathCost = (M, p) => { let c = 0; for (let k = 1; k < p.length; k++) c += M[p[k - 1]][p[k]]; return c; };
+function bestOrder(M, fixLast){
+  const n = M.length, free = [];
+  for (let i = 1; i < n - (fixLast ? 1 : 0); i++) free.push(i);
+  const m = free.length, tail = fixLast ? [n - 1] : [];
+  if (m <= 1) return [...Array(n).keys()];
+  if (m <= 12) {                                           // Held-Karp over the free stops
+    const S = 1 << m, dp = new Float64Array(S * m).fill(Infinity), par = new Int8Array(S * m).fill(-1);
+    for (let j = 0; j < m; j++) dp[(1 << j) * m + j] = M[0][free[j]];
+    for (let s = 1; s < S; s++) for (let j = 0; j < m; j++) {
+      const v = dp[s * m + j];
+      if (!(s >> j & 1) || v === Infinity) continue;
+      for (let q = 0; q < m; q++) if (!(s >> q & 1)) {
+        const ns = s | 1 << q, c = v + M[free[j]][free[q]];
+        if (c < dp[ns * m + q]) { dp[ns * m + q] = c; par[ns * m + q] = j; }
+      }
+    }
+    const full = S - 1; let bj = 0, bc = Infinity;
+    for (let j = 0; j < m; j++) { const c = dp[full * m + j] + (fixLast ? M[free[j]][n - 1] : 0); if (c < bc) { bc = c; bj = j; } }
+    const seq = [];
+    for (let s = full, j = bj; j >= 0;) { seq.push(free[j]); const pj = par[s * m + j]; s &= ~(1 << j); j = pj; }
+    return [0, ...seq.reverse(), ...tail];
+  }
+  let p = [0];
+  const left = new Set(free);
+  while (left.size) { const u = p[p.length - 1]; let b = -1; for (const v of left) if (b < 0 || M[u][v] < M[u][b]) b = v; p.push(b); left.delete(b); }
+  p = p.concat(tail);
+  const lo = 1, hi = p.length - 1 - tail.length;
+  let best = pathCost(M, p), better = true, guard = 0;
+  while (better && guard++ < 50) {
+    better = false;
+    for (let i = lo; i < hi; i++) for (let j = i + 1; j <= hi; j++) {
+      const q = p.slice(0, i).concat(p.slice(i, j + 1).reverse(), p.slice(j + 1)), c = pathCost(M, q);
+      if (c < best - 1e-6) { p = q; best = c; better = true; }
+    }
+    for (let i = lo; i <= hi; i++) for (let j = lo; j <= hi; j++) {
+      if (i === j) continue;
+      const q = p.slice(), v = q.splice(i, 1)[0]; q.splice(j, 0, v);
+      const c = pathCost(M, q);
+      if (c < best - 1e-6) { p = q; best = c; better = true; }
+    }
+  }
+  return p;
+}
+// a day that ends where it started, or at a place to sleep or fly from, keeps its last stop
+function guessFixLast(st){
+  const a = st[0], b = st[st.length - 1];
+  if (hav(a, b) < 0.4 || /숙소|호텔|리조트|펜션|게스트|민박|스테이|공항|하우스|콘도/.test(b.name)) return true;
+  const p = nearestPlace(b.lat, b.lon, 0.1);
+  return !!p && /숙소|캠핑장|공항/.test(CATS[p.cat]);
+}
+async function openOrder(d){
+  const day = trip.days[d];
+  if (!day || day.stops.length < 3) return toast('장소가 3곳 이상일 때 순서를 정리할 수 있습니다.');
+  const stops = day.stops.slice(), token = {};
+  let fix = guessFixLast(stops), body;
+  openView('order', v => {
+    view.token = token;
+    body = h('div', {'aria-live': 'polite'}, h('p', {class: 'hint'}, '길을 계산하는 중…'));
+    put(v, vhead((d + 1) + '일차 동선 자동 정리'),
+      h('p', {class: 'hint', style: 'margin-bottom:14px'}, '이동 시간이 가장 짧은 순서를 찾습니다. 첫 장소(' + stops[0].name + ')는 출발지로 그대로 둡니다.'), body);
+  });
+  const live = () => !!view && view.token === token;
+  const C = await costMatrix(stops, live);
+  if (!C || !live()) return;
+  const draw = () => {
+    const ord = bestOrder(C.M, fix), id = stops.map((_, k) => k);
+    const cur = pathCost(C.M, id), nw = pathCost(C.M, ord), gain = cur - nw, same = ord.every((v, k) => v === k) || gain < 1;
+    body.textContent = '';
+    put(body,
+      h('label', {class: 'switch', style: 'margin-bottom:14px'},
+        h('span', null, h('b', null, '마지막 장소도 그대로 두기'), h('span', {class: 'hint'}, '숙소처럼 하루를 마칠 곳이 정해져 있으면 켜 두세요.')),
+        h('input', {type: 'checkbox', checked: fix, onchange: e => { fix = e.target.checked; draw(); }})),
+      h('div', {class: 'cmp'},
+        h('div', null, h('span', {class: 'lbl'}, '지금 순서'), h('b', null, '약 ' + fmtMin(cur)), h('span', null, fmtKm(pathCost(C.K, id)))),
+        h('div', {class: same ? '' : 'win'}, h('span', {class: 'lbl'}, '정리한 순서'), h('b', null, '약 ' + fmtMin(nw)), h('span', null, fmtKm(pathCost(C.K, ord))))),
+      h('p', {class: same ? 'hint gain' : 'gain'}, same ? '지금 순서가 이미 가장 짧습니다.' : '이동 시간이 약 ' + fmtMin(gain) + ' 줄어듭니다.'),
+      h('ol', {class: 'order-list', style: '--c:' + dayColor(d)}, ord.map((k, pos) => h('li', {class: k !== pos ? 'moved' : null},
+        h('span', {class: 'n'}, String(pos + 1)), h('span', {class: 'o-name'}, stops[k].name), k !== pos ? h('span', {class: 'o-was'}, '원래 ' + (k + 1) + '번') : null))),
+      h('p', {class: 'hint', style: 'margin:10px 0'}, '자동차로 계산한 추정 시간입니다.' + (stops.some(s => s.time) ? ' 시간을 넣은 장소는 시간과 함께 옮겨지니, 바꾼 뒤 예상 도착 시각을 확인해 주세요.' : '')),
+      h('div', {class: 'row2', style: 'margin-top:8px'},
+        h('button', {class: 'btn', type: 'button', onclick: () => closeView()}, '그대로 두기'),
+        h('button', {class: 'btn primary', type: 'button', disabled: same, onclick: () => applyOrder(d, stops, ord, gain)}, '이 순서로 바꾸기')));
+  };
+  draw();
+}
+function applyOrder(d, stops, ord, gain){
+  const day = trip.days[d];
+  if (!day || day.stops.length !== stops.length || day.stops.some((s, k) => s !== stops[k])) { toast('그사이 일정이 바뀌어 다시 계산합니다.'); return openOrder(d); }
+  const old = day.stops.slice();
+  day.stops = ord.map(k => old[k]);
+  state.sel = null; legOpen = null;
+  closeView(true); commit(); setSnap('half');
+  toast('동선을 정리했습니다. 이동 시간이 약 ' + fmtMin(gain) + ' 줄었습니다.', '되돌리기', () => { trip.days[d].stops = old; commit(); });
+}
+
+/* ================= sending a trip as a link ================= */
+// The whole trip rides in the link's #fragment, compressed and base64url-encoded. Browsers never send the fragment to
+// the server, so the itinerary goes from phone to phone (through the chat app) and nowhere else. Check marks stay home.
+const LINK_KEY = 'trip=', BEFORE_KEY = 'jejumap.trip.beforeLink';
+const b64u = {
+  enc(b){ let s = ''; for (let i = 0; i < b.length; i += 0x8000) s += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000)); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); },
+  dec(s){ s = s.replace(/-/g, '+').replace(/_/g, '/'); while (s.length % 4) s += '='; return b64bytes(s); }
+};
+const streamBytes = async (bytes, t) => new Uint8Array(await new Response(new Blob([bytes]).stream().pipeThrough(t)).arrayBuffer());
+async function packTrip(t){
+  const o = JSON.parse(JSON.stringify(t));
+  for (const d of o.days) for (const s of d.stops) { delete s.done; delete s.doneAt; }
+  let json = JSON.stringify(o);
+  if (json.length > 30000) { for (const d of o.days) for (const s of d.stops) { delete s.walk; delete s.airIn; delete s.airOut; } json = JSON.stringify(o); }
+  const raw = new TextEncoder().encode(json);
+  if (window.CompressionStream) try { return 'z' + b64u.enc(await streamBytes(raw, new CompressionStream('deflate'))); } catch (e) {}
+  return 'j' + b64u.enc(raw);
+}
+async function unpackTrip(code){
+  let raw = b64u.dec(code.slice(1));
+  if (code[0] === 'z') raw = await streamBytes(raw, new DecompressionStream('deflate'));
+  else if (code[0] !== 'j') throw new Error('format');
+  return sanitizeTrip(JSON.parse(new TextDecoder().decode(raw)));
+}
+const linkCode = s => { const m = /trip=([zj][A-Za-z0-9_-]{8,})/.exec(String(s || '')); return m ? m[1] : ''; };
+// Safari wants the share sheet opened right in the tap, so the link is made beforehand (when 여행 정보 opens)
+let shareCache = null;
+async function makeLink(){
+  const key = JSON.stringify(trip);
+  if (!shareCache || shareCache.key !== key) shareCache = {key, url: location.origin + location.pathname + '#' + LINK_KEY + await packTrip(trip)};
+  return shareCache.url;
+}
+async function shareTrip(){
+  const n = countStops(trip);
+  if (!n) return toast('보낼 장소가 아직 없습니다.');
+  let url;
+  try { url = shareCache && shareCache.key === JSON.stringify(trip) ? shareCache.url : await makeLink(); }
+  catch (e) { return toast('링크를 만들지 못했습니다.'); }
+  const text = '제주 여행 일정 ‘' + trip.title + '’ (' + trip.days.length + '일, ' + n + '곳)';
+  if (navigator.share) {
+    try { await navigator.share({title: trip.title, text, url}); return; } catch (e) { if (e && e.name === 'AbortError') return; }
+  }
+  try { await navigator.clipboard.writeText(url); toast('일정 링크를 복사했습니다. 카카오톡이나 문자에 붙여 넣어 보내세요.', null, null, 5000); }
+  catch (e) { openLinkText(url); }
+}
+function openLinkText(url){
+  openView('link', v => {
+    const ta = h('textarea', {class: 'in', id: fid(), rows: 5, readOnly: true}, url);
+    put(v, vhead('일정 링크', openTrip), h('p', {class: 'hint', style: 'margin-bottom:12px'}, '아래 링크를 길게 눌러 전부 복사한 뒤 보내 주세요.'), field('링크', ta));
+    setTimeout(() => ta.select(), 50);
+  });
+}
+async function receiveLink(code, src){
+  let t = null;
+  try { t = await unpackTrip(code); } catch (e) {}
+  if (!t) return toast('일정 링크를 읽지 못했습니다. 링크가 잘리지 않고 전부 복사됐는지 확인해 주세요.', null, null, 6000);
+  const n = countStops(t), mine = countStops(trip);
+  const sig = x => x.title + JSON.stringify(x.days.map(d => d.stops.map(s => [s.name, s.lat, s.lon, s.time])));
+  if (mine && sig(t) === sig(trip)) return toast('받은 일정과 같은 일정이 이미 열려 있습니다.');
+  const open = () => {
+    const old = trip;
+    if (mine) store.set(BEFORE_KEY, JSON.stringify(old));
+    replaceTrip(t);
+    // KakaoTalk's own browser keeps its own storage: the trip belongs in the phone's browser, where the app lives
+    if (/KAKAOTALK/i.test(UA) && src) toast('카카오톡 안에서 열렸습니다. 앱에 저장하려면 기본 브라우저로 여세요.', '브라우저로 열기',
+      () => { location.href = 'kakaotalk://web/openExternal?url=' + encodeURIComponent(src); }, 15000);
+    else toast('받은 일정 ‘' + t.title + '’' + josa(t.title, '을', '를') + ' 열었습니다.', mine ? '되돌리기' : null, mine ? () => replaceTrip(old, '전에 쓰던 일정으로 되돌렸습니다.') : null, 8000);
+  };
+  if (!mine) return open();
+  ask('받은 일정을 열까요?', '‘' + t.title + '’ · ' + t.days.length + '일 · 장소 ' + n + '곳. 지금 일정(장소 ' + mine + '곳)은 이 기기에 보관해 두고, 여행 정보에서 다시 열 수 있습니다.', '열기', open);
+}
+function restoreBefore(){
+  let t = null;
+  try { t = sanitizeTrip(JSON.parse(store.get(BEFORE_KEY))); } catch (e) {}
+  if (!t) return toast('보관한 일정을 읽지 못했습니다.');
+  store.set(BEFORE_KEY, JSON.stringify(trip));          // a swap: the trip open now is kept in its place
+  replaceTrip(t, '‘' + t.title + '’' + josa(t.title, '을', '를') + ' 다시 열었습니다. 방금 일정은 보관해 두었습니다.');
+}
+function openPaste(){
+  openView('paste', v => {
+    const ta = h('textarea', {class: 'in', id: fid(), rows: 4, placeholder: '받은 일정 링크를 여기에 붙여 넣으세요', spellcheck: false, autocomplete: 'off'});
+    const go = () => {
+      const c = linkCode(ta.value);
+      if (!c) return toast('링크에서 일정을 찾지 못했습니다. ‘#trip=’이 들어 있는 링크 전체를 붙여 넣어 주세요.', null, null, 5000);
+      closeView(); receiveLink(c);
+    };
+    put(v, vhead('받은 링크로 일정 열기', openTrip),
+      h('p', {class: 'hint', style: 'margin-bottom:12px'}, '카카오톡 등으로 받은 일정 링크를 붙여 넣으면 이 앱에서 엽니다. 아이폰 홈 화면 앱처럼 링크를 눌러도 앱으로 바로 열리지 않을 때 쓰세요.'),
+      field('일정 링크', ta),
+      navigator.clipboard && navigator.clipboard.readText ? h('button', {class: 'btn wide', type: 'button', style: 'margin-bottom:8px', html: IC.open + '<span>복사해 둔 링크 붙여넣기</span>',
+        onclick: async () => { try { ta.value = await navigator.clipboard.readText(); } catch (e) { toast('붙여넣기 권한이 없습니다. 입력칸을 길게 눌러 붙여 넣어 주세요.'); } }}) : null,
+      h('button', {class: 'btn primary wide', type: 'button', onclick: go}, '이 일정 열기'));
+    return ta;
+  });
+}
+
+/* ================= photo journal ================= */
+// Photos live in this browser's IndexedDB, filed under the stop's id: a 480 px thumbnail (pins, lists, playback) and a
+// 1600 px copy (the viewer). They never leave the phone, and links and trip files go without them.
+const PH = {db: null, ready: null, idx: new Map(), failed: false};      // idx: stop id -> [{id, url, t, bytes}]
+function phDb(){
+  if (!PH.ready) PH.ready = new Promise((res, rej) => {
+    if (!window.indexedDB) return rej(new Error('no IndexedDB'));
+    const r = indexedDB.open('jejumap', 1);
+    r.onupgradeneeded = () => { const db = r.result; for (const n of ['thumbs', 'full']) if (!db.objectStoreNames.contains(n)) db.createObjectStore(n, {keyPath: 'id'}); };
+    r.onsuccess = () => res(PH.db = r.result);
+    r.onerror = () => rej(r.error);
+    r.onblocked = () => rej(new Error('blocked'));
+  });
+  return PH.ready;
+}
+const phReq = r => new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+const phDone = tx => new Promise((res, rej) => { tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error); tx.onabort = () => rej(tx.error || new Error('abort')); });
+const photosOf = s => (s && s.id && PH.idx.get(s.id)) || [];
+function indexPhoto(r){
+  let a = PH.idx.get(r.sid);
+  if (!a) PH.idx.set(r.sid, a = []);
+  a.push({id: r.id, url: URL.createObjectURL(r.thumb), t: r.t || 0, bytes: r.bytes || 0});
+  a.sort((x, y) => x.t - y.t);
+}
+async function loadPhotos(){
+  try {
+    const db = await phDb(), all = await phReq(db.transaction('thumbs').objectStore('thumbs').getAll());
+    for (const r of all) if (r && r.sid && r.thumb instanceof Blob) indexPhoto(r);
+    if (PH.idx.size && !play) { rebuildScene(); renderPanel(); }
+  } catch (e) { PH.failed = true; console.warn('photos unavailable', e); }
+}
+async function shrinkPhoto(file){
+  let src, url = null;
+  try { src = await createImageBitmap(file, {imageOrientation: 'from-image'}); }
+  catch (e) {
+    url = URL.createObjectURL(file);
+    src = await new Promise((res, rej) => { const im = new Image(); im.onload = () => res(im); im.onerror = () => rej(new Error('decode')); im.src = url; });
+  }
+  try {
+    const w0 = src.naturalWidth || src.width, h0 = src.naturalHeight || src.height;
+    if (!w0 || !h0) throw new Error('size');
+    const draw = (max, q) => {
+      const k = Math.min(1, max / Math.max(w0, h0)), c = document.createElement('canvas');
+      c.width = Math.max(1, Math.round(w0 * k)); c.height = Math.max(1, Math.round(h0 * k));
+      const g = c.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height); g.drawImage(src, 0, 0, c.width, c.height);
+      return new Promise((res, rej) => c.toBlob(b => b ? res(b) : rej(new Error('encode')), 'image/jpeg', q));
+    };
+    return {full: await draw(1600, 0.84), thumb: await draw(480, 0.78)};
+  } finally { if (src.close) src.close(); if (url) URL.revokeObjectURL(url); }
+}
+async function addPhotos(s, files){
+  let ok = 0, bad = 0;
+  for (const f of files) {
+    try {
+      const im = await shrinkPhoto(f), db = await phDb();
+      const r = {id: newId() + newId(), sid: s.id, thumb: im.thumb, t: f.lastModified || Date.now(), bytes: im.full.size + im.thumb.size, added: Date.now()};
+      const tx = db.transaction(['thumbs', 'full'], 'readwrite');
+      tx.objectStore('thumbs').put(r); tx.objectStore('full').put({id: r.id, blob: im.full});
+      await phDone(tx);
+      indexPhoto(r); ok++;
+    } catch (e) {
+      bad++; console.warn('photo', e);
+      if (e && e.name === 'QuotaExceededError') { toast('저장 공간이 부족해 사진을 더 넣지 못했습니다.'); break; }
+    }
+  }
+  return {ok, bad};
+}
+async function deletePhotos(ids){
+  const db = await phDb(), tx = db.transaction(['thumbs', 'full'], 'readwrite');
+  for (const id of ids) { tx.objectStore('thumbs').delete(id); tx.objectStore('full').delete(id); }
+  await phDone(tx);
+  for (const [sid, a] of PH.idx) {
+    for (let k = a.length - 1; k >= 0; k--) if (ids.includes(a[k].id)) { URL.revokeObjectURL(a[k].url); a.splice(k, 1); }
+    if (!a.length) PH.idx.delete(sid);
+  }
+}
+async function fullPhoto(id){ const db = await phDb(); const r = await phReq(db.transaction('full').objectStore('full').get(id)); return r && r.blob; }
+// photos filed under stops that are in neither the open trip nor the one kept aside when a link was opened
+function strayPhotos(){
+  const keep = new Set(trip.days.flatMap(x => x.stops.map(s => s.id)));
+  try { const b = JSON.parse(store.get(BEFORE_KEY) || 'null'); if (b && b.days) for (const x of b.days) for (const s of x.stops || []) if (s && s.id) keep.add(s.id); } catch (e) {}
+  return [...PH.idx].filter(([sid]) => !keep.has(sid)).flatMap(([, a]) => a.map(p => p.id));
+}
+function photoGroup(d, i){
+  const s = trip.days[d].stops[i], box = h('div', {class: 'group'}), grid = h('div', {class: 'ph-grid'});
+  const draw = () => {
+    grid.textContent = '';
+    photosOf(s).forEach((p, k) => grid.append(h('button', {class: 'ph-th', type: 'button', 'aria-label': '사진 ' + (k + 1) + ' 크게 보기', onclick: () => openViewer(d, i, k)},
+      h('img', {src: p.url, alt: '', decoding: 'async'}))));
+    grid.hidden = !grid.children.length;
+  };
+  const inp = h('input', {type: 'file', accept: 'image/*', multiple: true, hidden: true, onchange: async () => {
+    const files = [...inp.files]; inp.value = '';
+    if (!files.length) return;
+    add.disabled = true; add.lastChild.textContent = '사진 넣는 중… (' + files.length + '장)';
+    const r = await addPhotos(s, files);
+    add.disabled = false; add.lastChild.textContent = '사진 넣기';
+    draw(); if (!play) rebuildScene();
+    toast(r.ok ? '사진 ' + r.ok + '장을 넣었습니다.' + (r.bad ? ' 읽지 못한 ' + r.bad + '장은 뺐습니다.' : '') : '사진을 읽지 못했습니다. JPG나 PNG 사진인지 확인해 주세요.');
+  }});
+  const add = h('button', {class: 'btn', type: 'button', html: IC.camera + '<span>사진 넣기</span>', disabled: PH.failed, onclick: () => inp.click()});
+  draw(); box.redraw = draw;
+  return put(box, grid, add, inp, h('p', {class: 'hint'}, PH.failed ? '이 브라우저에서는 사진을 저장할 수 없습니다. 개인정보 보호 모드인지 확인해 주세요.'
+    : '사진은 이 기기에만 저장되고, 동선 재생 때 이 장소에서 보여 줍니다. 링크나 파일로 일정을 보낼 때는 빠집니다.'));
+}
+function photoStats(){
+  const box = h('div', {class: 'group'});
+  if (PH.failed) return put(box, h('p', {class: 'hint'}, '이 브라우저에서는 사진을 저장할 수 없습니다. 개인정보 보호 모드인지 확인해 주세요.'));
+  let n = 0, bytes = 0;
+  for (const a of PH.idx.values()) for (const p of a) { n++; bytes += p.bytes; }
+  const stray = strayPhotos();
+  put(box, h('p', {class: 'hint'}, n ? '이 기기에 사진 ' + n + '장(약 ' + Math.max(0.1, bytes / 1048576).toFixed(1) + 'MB)이 저장되어 있습니다. 장소의 ‘고치기’에서 넣고 지울 수 있습니다.'
+    : '장소의 ‘고치기’에서 사진을 넣으면 지도 핀과 동선 재생에 나옵니다. 사진은 이 기기에만 저장됩니다.'));
+  if (stray.length) box.append(h('button', {class: 'btn danger', type: 'button', onclick: () =>
+    ask('일정에 없는 사진을 지울까요?', '지금 일정에 없는 장소에 붙어 있던 사진 ' + stray.length + '장을 이 기기에서 지웁니다. 되돌릴 수 없습니다.', '지우기', async () => {
+      try { await deletePhotos(stray); toast('사진 ' + stray.length + '장을 지웠습니다.'); } catch (e) { toast('사진을 지우지 못했습니다.'); }
+      if (view && view.kind === 'trip') openTrip();
+    })}, '일정에 없는 사진 ' + stray.length + '장 지우기'));
+  return box;
+}
+/* ---- the photo viewer ---- */
+let vw = null;
+function openViewer(d, i, k){
+  const s = trip.days[d] && trip.days[d].stops[i];
+  if (!s || !photosOf(s).length) return;
+  vw = {d, i, sid: s.id, k, nav: !navArmed, back: document.activeElement, full: null};
+  navOpen();
+  $('viewer').hidden = false;
+  showViewer(); $('vwClose').focus();
+}
+async function showViewer(){
+  const a = PH.idx.get(vw.sid) || [];
+  if (!a.length) return closeViewer();
+  vw.k = clamp(vw.k, 0, a.length - 1);
+  const p = a[vw.k], s = trip.days[vw.d] && trip.days[vw.d].stops[vw.i], img = $('vwImg');
+  img.src = p.url;                                      // the thumbnail at once, the full photo once it is read
+  $('vwCap').textContent = (s ? s.name + ' · ' : '') + (vw.k + 1) + ' / ' + a.length;
+  $('vwPrev').hidden = vw.k === 0; $('vwNext').hidden = vw.k === a.length - 1;
+  const b = await fullPhoto(p.id).catch(() => null), g = vw;
+  if (b && g && (PH.idx.get(g.sid) || [])[g.k] === p) { if (g.full) URL.revokeObjectURL(g.full); g.full = URL.createObjectURL(b); img.src = g.full; }
+}
+function closeViewer(fromHistory){
+  if (!vw) return;
+  const g = vw; vw = null;
+  $('viewer').hidden = true; $('vwImg').removeAttribute('src');
+  if (g.full) URL.revokeObjectURL(g.full);
+  if (!fromHistory && g.nav) navClose();
+  if (g.back && g.back.isConnected) g.back.focus({preventScroll: true});
+}
+const viewerStep = k => { if (vw) { vw.k += k; showViewer(); } };
+$('vwClose').innerHTML = IC.close; $('vwPrev').innerHTML = IC.prev; $('vwNext').innerHTML = IC.next; $('vwDel').innerHTML = IC.trash;
+$('vwClose').addEventListener('click', () => closeViewer());
+$('vwPrev').addEventListener('click', () => viewerStep(-1));
+$('vwNext').addEventListener('click', () => viewerStep(1));
+$('vwDel').addEventListener('click', () => {
+  if (!vw) return;
+  const p = (PH.idx.get(vw.sid) || [])[vw.k];
+  if (p) ask('이 사진을 삭제하시겠습니까?', '삭제한 사진은 되돌릴 수 없습니다.', '삭제', async () => {
+    try { await deletePhotos([p.id]); } catch (e) { return toast('사진을 지우지 못했습니다.'); }
+    document.querySelectorAll('#vSub .group').forEach(g => g.redraw && g.redraw());
+    if (!play) rebuildScene();
+    if (vw) showViewer();
+    toast('사진을 삭제했습니다.');
+  });
+});
+(() => {      // swipe sideways between photos
+  const el = $('viewer'); let sx = null;
+  el.addEventListener('pointerdown', e => { if (!e.target.closest('button')) sx = {x: e.clientX, y: e.clientY}; });
+  el.addEventListener('pointerup', e => {
+    if (!sx) return;
+    const dx = e.clientX - sx.x, dy = e.clientY - sx.y; sx = null;
+    if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy)) viewerStep(dx < 0 ? 1 : -1);
+  });
+  el.addEventListener('keydown', e => { if (e.key === 'ArrowRight') viewerStep(1); else if (e.key === 'ArrowLeft') viewerStep(-1); });
+})();
+/* ---- photos during playback: a print that comes up while the mover waits at the stop ---- */
+let ppKey = '';
+function playPhoto(ph){
+  const el = $('playPhoto');
+  const s = ph && trip.days[ph.at.d] && trip.days[ph.at.d].stops[ph.at.i], a = photosOf(s);
+  if (!a.length) { if (ppKey) { ppKey = ''; el.classList.remove('on'); } return; }
+  const n = Math.min(a.length, PHOTO_MAX), k = clamp(Math.floor(ph.f * n), 0, n - 1), key = s.id + ':' + k;
+  if (key === ppKey) return;
+  ppKey = key;
+  $('ppImg').src = a[k].url;
+  $('ppCap').textContent = (ph.at.i + 1) + '. ' + s.name + (n > 1 ? '  ' + (k + 1) + '/' + n : '');
+  el.style.setProperty('--c', dayColor(ph.at.d));
+  el.classList.remove('on'); void el.offsetWidth; el.classList.add('on');
+}
+
 /* ---- installable app: offline cache (sw.js), updates, install ---- */
 // A new version installs in the background and waits until the user picks '새로 열기' (or the app is next started
 // fresh). The trip in localStorage is never part of that, so it survives every update.
@@ -2619,7 +3388,7 @@ $('mast').addEventListener('click', openTrip);
 $('titleBtn').addEventListener('click', () => state.day >= 0 && trip.days.length > 1 ? openDay(state.day) : openTrip());
 addEventListener('keydown', e => {
   if (e.key !== 'Escape') return;
-  if (askCb) closeAsk(false); else if (view && !state.pick) closeView();
+  if (askCb) closeAsk(false); else if (vw) closeViewer(); else if (view && !state.pick) closeView();
 });
 const relayout = () => { measurePeek(); setSnap(snap); resize(); };
 addEventListener('resize', relayout);
@@ -2663,6 +3432,9 @@ buildGraph();
 parseBuildings();
 parseCover();
 buildGeoLabels();
+// on a day of the trip the app opens on that day, with its check list and the next stop
+const td0 = todayIndex();
+if (td0 >= 0) { state.today = true; state.todayDay = td0; state.day = td0; }
 rebuildScene();
 renderPanel(false);
 measurePeek(); setSnap('peek'); resize();
@@ -2674,6 +3446,20 @@ if (document.fonts && document.fonts.ready) document.fonts.ready.then(relayout);
 // how long this start took (shown in 여행 정보): the whole start, and the part spent reading the map data
 bootSec = (performance.now() / 1000).toFixed(1); dataSec = ((window.__bootData || 0) / 1000).toFixed(1);
 $('loading').classList.add('done'); setTimeout(() => $('loading').remove(), 500);
+// today, with the location already allowed once: show where the phone is without asking again
+if (todayOn() && navigator.geolocation && navigator.permissions && window.isSecureContext)
+  navigator.permissions.query({name: 'geolocation'}).then(p => { if (p.state === 'granted' && me.watch == null) startLoc(false); }).catch(() => {});
+loadPhotos();
+// a trip sent as a link (#trip=...): read it, then take it out of the address so a reload does not ask again
+const takeLink = () => {
+  const c = linkCode(location.hash);
+  if (!c) return;
+  const src = location.href;
+  history.replaceState(history.state, '', location.pathname + location.search);
+  setTimeout(() => receiveLink(c, src), 600);
+};
+takeLink();
+addEventListener('hashchange', takeLink);
 // a stored trip this version could not read was set aside, never overwritten: offer it as a file
 if (rescued) setTimeout(() => toast('저장된 일정을 이 버전에서 읽지 못해 따로 보관해 두었습니다.', '파일로 받기', () => {
   const a = h('a', {href: URL.createObjectURL(new Blob([store.get(RESCUE_KEY) || ''], {type: 'application/json'})), download: 'jeju-trip-saved.json'});
@@ -2689,6 +3475,11 @@ window.__jeju = {cam, goal, state, mover, get mode(){ return moverMode; }, get p
   get bldVerts(){ return B ? B.verts : 0; }, ask: () => askCb != null, pwa, toast,
   get trip(){ return trip; }, get pins(){ return pins; }, get routes(){ return routes; }, get legs(){ return legs; },
   setSnap, openSearch, openStop, openTrip, openDay, search: searchPlaces,
+  // today, location, directions, reordering, links, photos
+  setToday, checkIn, todayIndex, me, dayPlan, openOrder, costMatrix, bestOrder, pathCost, kakaoUrl, naverPath, openNav,
+  packTrip, unpackTrip, linkCode, receiveLink, makeLink, shareTrip, openPaste, restoreBefore,
+  async addPhoto(d, i, blob){ const r = await addPhotos(trip.days[d].stops[i], [blob]); if (!play) rebuildScene(); return r; }, photosOf: (d, i) => photosOf(trip.days[d].stops[i]).length,
+  openViewer, get viewer(){ return vw && {k: vw.k, sid: vw.sid}; }, strayPhotos, get photoFailed(){ return PH.failed; },
   async loadExample(){ replaceTrip(sanitizeTrip(await (await fetch('data/example_trip.json')).json())); },
   get osm(){ return {tilesBuilt: B ? B.built : 0, buildings: B ? B.x.length : 0, graphNodes: G ? G.n : 0, peekPx, inset}; }};
 }
