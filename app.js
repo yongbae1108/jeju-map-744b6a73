@@ -58,7 +58,7 @@ const ptList = (a, n) => Array.isArray(a) ? a.filter(p => Array.isArray(p) && p.
 const airOf = o => o && ptList(o.path, 3).length > 1 ? {path: ptList(o.path, 3), taxi: ptList(o.taxi, 2)} : null;
 // Saved trips outlive app updates: every stored trip carries the schema version it was written with, older versions are
 // migrated step by step here, and fields this version does not know are kept so an update never drops them.
-const APP_VERSION = '2026.11.27-2', SCHEMA = 2;
+const APP_VERSION = '2026.11.27-3', SCHEMA = 2;
 let bootSec = '', dataSec = '';
 const MIGRATE = {
   1: o => { o.air = o.air !== false; return o; }      // v1 (before 2026-11-27): no airport flights yet -> on by default
@@ -1733,12 +1733,49 @@ const esc = s => String(s).replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;',
 const josa = (w, a, b) => { const c = w.charCodeAt(w.length - 1); return c >= 0xac00 && c <= 0xd7a3 ? ((c - 0xac00) % 28 ? a : b) : a + '(' + b + ')'; };
 let toastTimer = 0;
 function toast(msg, act, fn, ms){
+  const el = $('toast');
   $('toastText').textContent = msg;
   const b = $('toastAct'); b.hidden = !act; b.textContent = act || '';
-  b.onclick = act ? () => { $('toast').classList.remove('on'); fn(); } : null;
-  $('toast').classList.add('on');
-  clearTimeout(toastTimer); toastTimer = setTimeout(() => $('toast').classList.remove('on'), ms || (act ? 6000 : 3200));
+  b.onclick = act ? () => { el.classList.remove('on'); fn(); } : null;
+  el.classList.remove('dragging'); el.style.removeProperty('--tx'); el.style.removeProperty('--ty'); el.style.opacity = '';
+  el.classList.add('on');
+  el.dataset.ms = ms || (act ? 6000 : 3200);
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => el.classList.remove('on'), +el.dataset.ms);
 }
+// a toast can be swiped away, sideways or up; let go early and it settles back and stays a little longer
+(() => {
+  const el = $('toast');
+  let d = null;
+  el.addEventListener('pointerdown', e => {
+    if (!el.classList.contains('on') || e.target.closest('button') || e.button > 0) return;
+    d = {id: e.pointerId, x0: e.clientX, y0: e.clientY, dx: 0, dy: 0, w: el.offsetWidth};
+    try { el.setPointerCapture(e.pointerId); } catch (err) {}
+    el.classList.add('dragging');
+    clearTimeout(toastTimer);
+  });
+  el.addEventListener('pointermove', e => {
+    if (!d || e.pointerId !== d.id) return;
+    d.dx = e.clientX - d.x0; d.dy = Math.min(0, e.clientY - d.y0);
+    el.style.setProperty('--tx', d.dx + 'px'); el.style.setProperty('--ty', d.dy + 'px');
+    el.style.opacity = String(clamp(1 - Math.max(Math.abs(d.dx) / d.w, -d.dy / 60) * 0.9, 0.1, 1));
+  });
+  const end = e => {
+    if (!d || e.pointerId !== d.id) return;
+    const g = d; d = null;
+    el.classList.remove('dragging');
+    if (Math.abs(g.dx) > Math.min(90, g.w * 0.3) || g.dy < -36) {        // away: keep moving the way it was pushed
+      el.style.setProperty('--tx', (Math.abs(g.dx) > -g.dy ? Math.sign(g.dx) * (g.w + 40) : 0) + 'px');
+      if (Math.abs(g.dx) <= -g.dy) el.style.setProperty('--ty', '-80px');
+      el.style.opacity = '0'; el.classList.remove('on');
+      setTimeout(() => { if (!el.classList.contains('on')) { el.style.removeProperty('--tx'); el.style.removeProperty('--ty'); el.style.opacity = ''; } }, 260);
+    } else {
+      el.style.removeProperty('--tx'); el.style.removeProperty('--ty'); el.style.opacity = '';
+      toastTimer = setTimeout(() => el.classList.remove('on'), Math.max(2500, +el.dataset.ms / 2));
+    }
+  };
+  el.addEventListener('pointerup', end);
+  el.addEventListener('pointercancel', end);
+})();
 const WD = '일월화수목금토';
 function dayDate(d){
   if (!trip.startDate) return null;
@@ -2511,6 +2548,8 @@ function applyUpdate(){
 }
 if ('serviceWorker' in navigator && window.isSecureContext) {
   navigator.serviceWorker.addEventListener('controllerchange', () => { if (pwa.updating) location.reload(); });
+  // what the last install fetched and what it reused from the older cache (an update should fetch only changed files)
+  navigator.serviceWorker.addEventListener('message', e => { if (e.data && e.data.type === 'sw-installed') pwa.lastInstall = e.data; });
   navigator.serviceWorker.register('sw.js').then(reg => {
     pwa.reg = reg;
     if (reg.waiting && navigator.serviceWorker.controller) offerUpdate(reg.waiting);
@@ -2603,7 +2642,7 @@ window.__jeju = {cam, goal, state, mover, get mode(){ return moverMode; }, get p
     labels: play.segs.map(s => s.label), mode: play.segs[play.k].mode, paused: play.paused}; },
   stroll(d, i){ const s = trip.days[d].stops[i]; const w = s && walkOf(s); return w && {km: w.km, n: w.path.length, label: w.label}; },
   get trees(){ let tiles = 0, drawn = 0; for (const t of treeTiles.values()) if (t.mesh) { tiles++; if (t.mesh.visible) drawn += t.mesh.geometry.instanceCount; } return {tiles, built: treeCount, drawn}; },
-  get bldVerts(){ return B ? B.verts : 0; }, ask: () => askCb != null, pwa,
+  get bldVerts(){ return B ? B.verts : 0; }, ask: () => askCb != null, pwa, toast,
   get trip(){ return trip; }, get pins(){ return pins; }, get routes(){ return routes; }, get legs(){ return legs; },
   setSnap, openSearch, openStop, openTrip, openDay, search: searchPlaces,
   async loadExample(){ replaceTrip(sanitizeTrip(await (await fetch('data/example_trip.json')).json())); },

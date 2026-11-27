@@ -280,11 +280,14 @@ textarea.in{padding:10px 12px;min-height:72px;resize:vertical;line-height:1.5}
 #pickBar{position:fixed;z-index:6;left:12px;right:12px;bottom:calc(var(--sab) + 12px);display:grid;gap:10px;padding:14px}
 #pickBar p{margin:0;font-weight:600}
 #pickBar .row{display:grid;grid-template-columns:1fr auto;gap:8px}
-/* on a phone the toast sits over the map under the masthead, never over the sheet's rows; only its button takes taps */
+/* on a phone the toast sits over the map under the masthead, never over the sheet's rows; it can be swiped away */
 #toast{position:fixed;z-index:8;left:12px;right:68px;top:calc(var(--sat) + 64px);
   display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 14px;border-radius:var(--r-sm);background:var(--ink);color:#f6f0e3;font-size:14px;
-  box-shadow:0 2px 4px rgba(20,20,10,.2),0 8px 20px rgba(20,20,10,.18);opacity:0;pointer-events:none;transition:opacity .2s}
-#toast.on{opacity:1}
+  box-shadow:0 2px 4px rgba(20,20,10,.2),0 8px 20px rgba(20,20,10,.18);opacity:0;pointer-events:none;
+  transform:translate(var(--tx,0px),var(--ty,0px));transition:opacity .2s,transform .25s var(--ease);touch-action:none}
+#toast.on{opacity:1;pointer-events:auto;cursor:grab}
+#toast.dragging{transition:none;cursor:grabbing}
+body.playing #toast{top:calc(var(--sat) + 132px)}
 #toast button{min-height:36px;padding:0 4px;border:0;background:none;color:#f3cf73;font-weight:700;pointer-events:auto}
 #toast:not(.on) button{pointer-events:none}
 body.sheet-full #ctl,body.sheet-full #hud{visibility:hidden}
@@ -319,7 +322,7 @@ body.sheet-full #ctl,body.sheet-full #hud{visibility:hidden}
   #ctl{top:12px}
   #hud{top:12px;left:12px}
   #pickBar{left:calc(var(--panel-w) + 32px);right:auto;width:min(440px,calc(100% - var(--panel-w) - 64px));bottom:32px}
-  #toast{left:calc(var(--panel-w) + (100% - var(--panel-w)) / 2);right:auto;top:auto;bottom:40px;transform:translateX(-50%);
+  #toast{left:calc(var(--panel-w) + (100% - var(--panel-w)) / 2);right:auto;top:auto;bottom:40px;transform:translateX(-50%) translate(var(--tx,0px),var(--ty,0px));
     width:max-content;max-width:calc(100% - var(--panel-w) - 160px)}
   body.sheet-full #ctl,body.sheet-full #hud{visibility:visible}
   .stamp{width:70px}
