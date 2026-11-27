@@ -58,7 +58,7 @@ const ptList = (a, n) => Array.isArray(a) ? a.filter(p => Array.isArray(p) && p.
 const airOf = o => o && ptList(o.path, 3).length > 1 ? {path: ptList(o.path, 3), taxi: ptList(o.taxi, 2)} : null;
 // Saved trips outlive app updates: every stored trip carries the schema version it was written with, older versions are
 // migrated step by step here, and fields this version does not know are kept so an update never drops them.
-const APP_VERSION = '2026.11.27-8', SCHEMA = 2;
+const APP_VERSION = '2026.11.27-9', SCHEMA = 2;
 let bootSec = '', dataSec = '';
 const MIGRATE = {
   1: o => { o.air = o.air !== false; return o; }      // v1 (before 2026-11-27): no airport flights yet -> on by default
@@ -179,8 +179,8 @@ const elev = new Float32Array(NV);   // metres; land > 0, sea = synthetic shelf 
 
 const yv = new Float32Array(NV);     // vertex heights in km (exaggerated)
 function fillHeights(){ const e = state.exag * 0.001; for (let k = 0; k < NV; k++) yv[k] = elev[k] * e; }
-// true height (m) of the terrain surface, using the same two triangles per cell as the mesh; sea = 0
-function groundM(x, z){
+// height (m) of the island grid, using the same two triangles per cell as the mesh; sea = 0
+function gridM(x, z){
   const fx = (x + WX / 2) / WX * (GW - 1), fz = (z + WZ / 2) / WZ * (GH - 1);
   if (fx < 0 || fz < 0 || fx > GW - 1 || fz > GH - 1) return 0;
   const i = Math.min(GW - 2, fx | 0), j = Math.min(GH - 2, fz | 0), a = fx - i, b = fz - j, k = j * GW + i;
@@ -189,6 +189,35 @@ function groundM(x, z){
                        : elev[k + GW + 1] + (h01 - elev[k + GW + 1]) * (1 - a) + (h10 - elev[k + GW + 1]) * (1 - b);
   return v > 0 ? v : 0;
 }
+/* ---- Baengnokdam, the summit crater: too small for the 125 m grid, which shows only a shallow dent ---- */
+// About 560-600 m east-west and 375-400 m north-south, floor 1,838 m, rim up to 1,947 m on the west, the lake 1-2 m
+// deep (Encyclopedia of Korean Culture). The centre, the east rim (the summit marker and its steps) and the lake's
+// outline (about 110 m east-west by 135 m north-south) follow OpenStreetMap. Inside a block of grid cells around it
+// the ground follows this shape, drawn by a 10 m mesh; past the rim it eases back into the grid well before the edge.
+const CR = (() => {
+  const cx = toX(126.5333), cz = toZ(33.3621);
+  const fi = Math.round((cx + WX / 2) / WX * (GW - 1)), fj = Math.round((cz + WZ / 2) / WZ * (GH - 1));
+  const i0 = fi - 6, i1 = fi + 6, j0 = fj - 5, j1 = fj + 5, gx = i => -WX / 2 + i / (GW - 1) * WX, gz = j => -WZ / 2 + j / (GH - 1) * WZ;
+  return {cx, cz, a: 0.28, b: 0.195, la: 0.056, lb: 0.068, r2: 1.9, floor: 1838, lake: 1839.5, i0, i1, j0, j1, x0: gx(i0), x1: gx(i1), z0: gz(j0), z1: gz(j1)};
+})();
+const sstep = (e0, e1, v) => { const t = clamp((v - e0) / (e1 - e0), 0, 1); return t * t * (3 - 2 * t); };
+function craterM(x, z, base){
+  const dx = (x - CR.cx) / CR.a, dz = (z - CR.cz) / CR.b, r = Math.hypot(dx, dz);
+  if (r >= CR.r2) return base;
+  const rim = 1930 - 15 * (r > 1e-6 ? dx / r : 0);                      // 1,945 m on the west, 1,915 m on the east
+  if (r > 1) return rim + (base - rim) * sstep(1, CR.r2, r);             // the outer slope eases into the grid
+  const fl = CR.floor + 1.5 * (((x - CR.cx) / CR.la) ** 2 + ((z - CR.cz) / CR.lb) ** 2);   // a shallow floor, the lake's outline at 1,839.5 m
+  return fl + (rim - fl) * sstep(0.45, 1, r);                            // steep walls up to the rim
+}
+const inCrater = (x, z) => x > CR.x0 && x < CR.x1 && z > CR.z0 && z < CR.z1;
+// the grid vertices and weights behind gridM at (x, z), so the crater mesh can borrow the grid's colours and normals
+function gridBary(x, z){
+  const fx = (x + WX / 2) / WX * (GW - 1), fz = (z + WZ / 2) / WZ * (GH - 1);
+  const i = Math.min(GW - 2, fx | 0), j = Math.min(GH - 2, fz | 0), a = fx - i, b = fz - j, k = j * GW + i;
+  return a + b <= 1 ? [k, 1 - a - b, k + 1, a, k + GW, b] : [k + GW + 1, a + b - 1, k + GW, 1 - a, k + 1, 1 - b];
+}
+// true height (m) of the ground on the map: the grid, or the crater where it takes the grid's place
+function groundM(x, z){ const g = gridM(x, z); return inCrater(x, z) ? craterM(x, z, g) : g; }
 const groundY = (x, z) => groundM(x, z) * state.exag * 0.001;   // exaggerated, km
 fillHeights();
 
@@ -224,8 +253,20 @@ const LOOK = {
   tree: ['#5f8a55', '#6f9a5c', '#4f7a4c'], orchard: '#7aa04e'
 };
 
+const RAMP = LOOK.land.map(([m, hex]) => [m, lin(hex)]);
+function landColor(e, c){
+  let i = 1; while (i < RAMP.length - 1 && RAMP[i][0] < e) i++;
+  const a = RAMP[i - 1], b = RAMP[i];
+  return c.copy(a[1]).lerp(b[1], clamp((e - a[0]) / (b[0] - a[0]), 0, 1));
+}
 const terrainGeo = new THREE.BufferGeometry();
 const tPos = new Float32Array(NV * 3), tCol = new Float32Array(NV * 3);
+// Under the crater mesh the grid sinks out of sight. The block's edge stays put, so the seam is exact, and this runs
+// after the normals are worked out from the true heights, so the shading just outside the block is untouched.
+function sinkGrid(){
+  const e = state.exag * 0.001;
+  for (let j = CR.j0 + 1; j < CR.j1; j++) for (let i = CR.i0 + 1; i < CR.i1; i++) { const k = j * GW + i; tPos[k * 3 + 1] = (elev[k] - 150) * e; }
+}
 (function buildTerrain(){
   for (let j = 0; j < GH; j++) for (let i = 0; i < GW; i++) {
     const k = (j * GW + i) * 3;
@@ -236,22 +277,86 @@ const tPos = new Float32Array(NV * 3), tCol = new Float32Array(NV * 3);
     const a = j * GW + i, b = a + 1, c = a + GW, d = c + 1;
     idx[n++] = a; idx[n++] = c; idx[n++] = b; idx[n++] = b; idx[n++] = c; idx[n++] = d;
   }
-  const ramp = LOOK.land.map(([m, hex]) => [m, lin(hex)]), s0 = lin(LOOK.sea[0]), s1 = lin(LOOK.sea[1]), c = new THREE.Color();
+  const s0 = lin(LOOK.sea[0]), s1 = lin(LOOK.sea[1]), c = new THREE.Color();
   for (let k = 0; k < NV; k++) {
     const e = elev[k];
-    if (e > 0) {
-      let i = 1; while (i < ramp.length - 1 && ramp[i][0] < e) i++;
-      const a = ramp[i - 1], b = ramp[i];
-      c.copy(a[1]).lerp(b[1], clamp((e - a[0]) / (b[0] - a[0]), 0, 1));
-    } else c.copy(s0).lerp(s1, clamp(-e / SEA_DEPTH, 0, 1));
+    if (e > 0) landColor(e, c);
+    else c.copy(s0).lerp(s1, clamp(-e / SEA_DEPTH, 0, 1));
     tCol[k * 3] = c.r; tCol[k * 3 + 1] = c.g; tCol[k * 3 + 2] = c.b;
   }
   terrainGeo.setAttribute('position', new THREE.BufferAttribute(tPos, 3));
   terrainGeo.setAttribute('color', new THREE.BufferAttribute(tCol, 3));
   terrainGeo.setIndex(new THREE.BufferAttribute(idx, 1));
   terrainGeo.computeVertexNormals();
+  sinkGrid();
 })();
-scene.add(new THREE.Mesh(terrainGeo, new THREE.MeshStandardMaterial({vertexColors: true, roughness: 0.93, metalness: 0})));
+const terrainMat = new THREE.MeshStandardMaterial({vertexColors: true, roughness: 0.93, metalness: 0});
+scene.add(new THREE.Mesh(terrainGeo, terrainMat));
+// The crater in 10 m steps, coloured like the land with bare rock on the steep walls, and the lake on its floor: the
+// fine cells that dip under the lake level, drawn flat at that level (the ground hides what lies past the shore).
+const crater = (() => {
+  const nx = (CR.i1 - CR.i0) * 12 + 1, nz = (CR.j1 - CR.j0) * 12 + 1, n = nx * nz;
+  const hm = new Float32Array(n), pos = new Float32Array(n * 3), col = new Float32Array(n * 3);
+  for (let q = 0; q < nz; q++) for (let p = 0; p < nx; p++) {
+    const k = q * nx + p;
+    pos[k * 3] = CR.x0 + (CR.x1 - CR.x0) * p / (nx - 1); pos[k * 3 + 2] = CR.z0 + (CR.z1 - CR.z0) * q / (nz - 1);
+    hm[k] = groundM(pos[k * 3], pos[k * 3 + 2]);
+  }
+  // how much of the crater shows at each vertex (0 = plain grid): colours and normals blend from the grid's to the crater's
+  const own = new Float32Array(n), bary = [];
+  for (let k = 0; k < n; k++) {
+    const x = pos[k * 3], z = pos[k * 3 + 2];
+    own[k] = 1 - sstep(1.15, CR.r2, Math.hypot((x - CR.cx) / CR.a, (z - CR.cz) / CR.b));
+    bary.push(gridBary(x, z));
+  }
+  const sx = (CR.x1 - CR.x0) / (nx - 1) * 1000, sz = (CR.z1 - CR.z0) / (nz - 1) * 1000, rock = lin('#958b7c'), c = new THREE.Color();
+  for (let q = 0; q < nz; q++) for (let p = 0; p < nx; p++) {
+    const k = q * nx + p, h = i => hm[clamp(i, 0, n - 1)], [k0, w0, k1, w1, k2, w2] = bary[k];
+    const slope = Math.hypot((h(k + (p < nx - 1 ? 1 : 0)) - h(k - (p > 0 ? 1 : 0))) / (2 * sx), (h(k + (q < nz - 1 ? nx : 0)) - h(k - (q > 0 ? nx : 0))) / (2 * sz));
+    landColor(hm[k], c).lerp(rock, clamp((slope - 0.45) / 0.5, 0, 0.75));
+    for (let ch = 0; ch < 3; ch++) {
+      const g = tCol[k0 * 3 + ch] * w0 + tCol[k1 * 3 + ch] * w1 + tCol[k2 * 3 + ch] * w2;
+      col[k * 3 + ch] = g + ([c.r, c.g, c.b][ch] - g) * own[k];
+    }
+  }
+  const idx = [], lakePts = [];
+  for (let q = 0; q < nz - 1; q++) for (let p = 0; p < nx - 1; p++) {
+    const a = q * nx + p, b = a + 1, d = a + nx, e = d + 1;
+    idx.push(a, d, b, b, d, e);
+    const r = Math.hypot((pos[a * 3] - CR.cx) / CR.a, (pos[a * 3 + 2] - CR.cz) / CR.b);      // only inside the crater: the outer slopes lie lower too
+    if (r < 0.7 && Math.min(hm[a], hm[b], hm[d], hm[e]) < CR.lake) lakePts.push(a, d, b, b, d, e);
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  geo.setIndex(idx);
+  scene.add(new THREE.Mesh(geo, terrainMat));
+  const lpos = new Float32Array(lakePts.length * 3);
+  lakePts.forEach((k, m) => { lpos[m * 3] = pos[k * 3]; lpos[m * 3 + 2] = pos[k * 3 + 2]; });
+  const lgeo = new THREE.BufferGeometry();
+  lgeo.setAttribute('position', new THREE.BufferAttribute(lpos, 3));
+  const lake = new THREE.Mesh(lgeo, new THREE.MeshStandardMaterial({color: lin('#3f8d95'), roughness: 0.22, metalness: 0.1, transparent: true, opacity: 0.9, depthWrite: false}));
+  lake.renderOrder = 1; scene.add(lake);
+  function setY(){
+    const e = state.exag * 0.001;
+    for (let k = 0; k < n; k++) pos[k * 3 + 1] = hm[k] * e;
+    for (let m = 0; m < lpos.length / 3; m++) lpos[m * 3 + 1] = CR.lake * e;
+    geo.attributes.position.needsUpdate = true; geo.computeVertexNormals();
+    // outside the rim the grid's smooth normals take over, so the block shades exactly like the ground around it
+    const nn = geo.attributes.normal.array, gn = terrainGeo.attributes.normal.array;
+    for (let k = 0; k < n; k++) {
+      const [k0, w0, k1, w1, k2, w2] = bary[k], t = own[k];
+      let x = 0, y = 0, z = 0;
+      x = gn[k0 * 3] * w0 + gn[k1 * 3] * w1 + gn[k2 * 3] * w2; y = gn[k0 * 3 + 1] * w0 + gn[k1 * 3 + 1] * w1 + gn[k2 * 3 + 1] * w2; z = gn[k0 * 3 + 2] * w0 + gn[k1 * 3 + 2] * w1 + gn[k2 * 3 + 2] * w2;
+      x += (nn[k * 3] - x) * t; y += (nn[k * 3 + 1] - y) * t; z += (nn[k * 3 + 2] - z) * t;
+      const l = Math.hypot(x, y, z) || 1; nn[k * 3] = x / l; nn[k * 3 + 1] = y / l; nn[k * 3 + 2] = z / l;
+    }
+    geo.attributes.normal.needsUpdate = true;
+    lgeo.attributes.position.needsUpdate = true; lgeo.computeVertexNormals();
+  }
+  setY();
+  return {setY, lakeCells: lakePts.length / 6, lakeM2: lakePts.length / 6 * sx * sz};
+})();
 
 const water = new THREE.Mesh(new THREE.PlaneGeometry(WX, WZ),
   new THREE.MeshStandardMaterial({color: lin(LOOK.water), opacity: LOOK.waterOp, transparent: true, roughness: 0.3, metalness: 0.05, depthWrite: false}));
@@ -275,6 +380,8 @@ function applyExag(){
   terrainGeo.attributes.position.needsUpdate = true;
   terrainGeo.computeVertexNormals();
   terrainGeo.attributes.normal.needsUpdate = true;
+  sinkGrid();
+  crater.setY();
 }
 
 /* ================= roads, buildings, trees (OpenStreetMap) ================= */
@@ -3553,5 +3660,6 @@ window.__jeju = {cam, goal, state, mover, get mode(){ return moverMode; }, get p
   async addPhoto(d, i, blob){ const r = await addPhotos(trip.days[d].stops[i], [blob]); if (!play) rebuildScene(); return r; }, photosOf: (d, i) => photosOf(trip.days[d].stops[i]).length,
   openViewer, get viewer(){ return vw && {k: vw.k, sid: vw.sid}; }, strayPhotos, get photoFailed(){ return PH.failed; },
   async loadExample(src){ replaceTrip(sanitizeTrip(src || await (await fetch('data/example_trip.json')).json())); },   // src: a test's own trip
+  crater: () => ({lakeCells: crater.lakeCells, lakeM2: Math.round(crater.lakeM2), centre: groundM(CR.cx, CR.cz), rimW: groundM(CR.cx - CR.a, CR.cz), rimE: groundM(CR.cx + CR.a, CR.cz), grid: gridM(CR.cx, CR.cz)}),
   get osm(){ return {tilesBuilt: B ? B.built : 0, buildings: B ? B.x.length : 0, graphNodes: G ? G.n : 0, peekPx, inset}; }};
 }
