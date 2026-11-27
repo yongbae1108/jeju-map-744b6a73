@@ -58,7 +58,7 @@ const ptList = (a, n) => Array.isArray(a) ? a.filter(p => Array.isArray(p) && p.
 const airOf = o => o && ptList(o.path, 3).length > 1 ? {path: ptList(o.path, 3), taxi: ptList(o.taxi, 2)} : null;
 // Saved trips outlive app updates: every stored trip carries the schema version it was written with, older versions are
 // migrated step by step here, and fields this version does not know are kept so an update never drops them.
-const APP_VERSION = '2026.11.27-7', SCHEMA = 2;
+const APP_VERSION = '2026.11.27-8', SCHEMA = 2;
 let bootSec = '', dataSec = '';
 const MIGRATE = {
   1: o => { o.air = o.air !== false; return o; }      // v1 (before 2026-11-27): no airport flights yet -> on by default
@@ -2436,7 +2436,20 @@ function openTrip(){
     });
     const opt = (label, key, sk) => h('label', null, h('input', {type: 'checkbox', checked: state[key], onchange: e => {
       state[key] = e.target.checked; store.set(sk, state[key] ? '1' : '0'); dirty = true; }}), label);
-    put(v, vhead('여행 정보'),
+    // 휴대폰 앱으로 쓰기 comes first while the page is open in a browser tab (or a new version waits); inside the app it sits lower
+    const appTop = !standalone() || !!pwa.waiting;
+    const appSec = [h('h3', {class: 'group-h'}, '휴대폰 앱으로 쓰기'),
+      h('div', {class: 'group'},
+        pwa.waiting ? h('button', {class: 'btn primary', type: 'button', onclick: applyUpdate}, '새 버전으로 다시 열기') : null,
+        !standalone() && pwa.install ? h('button', {class: 'btn primary', type: 'button', html: IC.open + '<span>홈 화면에 앱 설치</span>', onclick: async () => {
+          const ev = pwa.install; pwa.install = null; ev.prompt(); try { await ev.userChoice; } catch (e) {} openTrip(); }}) : null,
+        standalone() ? h('p', {class: 'hint'}, '홈 화면 앱으로 열려 있습니다.')
+          : h('p', {class: 'hint'}, IS_IOS ? '홈 화면에 추가하면 앱처럼 열립니다. Safari의 공유 버튼 → ‘홈 화면에 추가’를 누르세요. 아이폰의 홈 화면 앱은 Safari와 저장 공간이 따로라, 추가한 뒤 ‘링크로 일정 보내기’로 일정을 옮겨 주세요.'
+            : '홈 화면에 추가하면 앱처럼 열립니다. Chrome은 오른쪽 위 ⋮ → ‘설치 및 바로가기 만들기’(또는 ‘앱 설치’) → ‘설치’, 삼성 인터넷은 ≡ → ‘현재 페이지 추가’ → ‘홈 화면’을 누르세요. 이 브라우저에서 설치한 앱은 지금 일정을 그대로 씁니다. 이미 설치했다면 홈 화면의 아이콘으로 여세요.'),
+        h('p', {class: 'hint'}, navigator.serviceWorker && navigator.serviceWorker.controller
+          ? '앱과 섬 전체 지도 자료가 이 기기에 저장되어 있어 인터넷 없이도 열립니다(주소 검색만 인터넷이 필요합니다). 앱의 새 버전이 나오면 알려 드리고, 새 버전으로 바뀌어도 일정은 그대로 남습니다.'
+          : '처음 연 뒤 잠시 지나면 앱과 지도 자료(약 7MB)가 이 기기에 저장되어, 그다음부터는 인터넷 없이도 열립니다.'))];
+    put(v, vhead('여행 정보'), appTop ? appSec : null,
       field('여행 이름', h('input', {class: 'in', id: fid(), value: trip.title, maxLength: 60, onchange: e => { trip.title = e.target.value.trim() || '나의 제주 여행'; commit(true); }})),
       field('시작일', h('input', {class: 'in', id: fid(), type: 'date', value: trip.startDate, onchange: e => { trip.startDate = e.target.value; commit(true); }}),
         '날짜를 넣으면 일차마다 날짜와 요일이 붙습니다.'),
@@ -2461,16 +2474,7 @@ function openTrip(){
       h('div', {class: 'group'},
         h('button', {class: 'btn', type: 'button', onclick: loadExample}, '예시 일정 불러오기 (2박 3일)'),
         h('button', {class: 'btn danger', type: 'button', onclick: () => { if (keepWarning()) replaceTrip(emptyTrip(), '빈 일정으로 시작합니다.'); }}, '빈 일정으로 새로 만들기')),
-      h('h3', {class: 'group-h'}, '휴대폰 앱으로 쓰기'),
-      h('div', {class: 'group'},
-        pwa.waiting ? h('button', {class: 'btn primary', type: 'button', onclick: applyUpdate}, '새 버전으로 다시 열기') : null,
-        !standalone() && pwa.install ? h('button', {class: 'btn', type: 'button', html: IC.open + '<span>홈 화면에 앱 설치</span>', onclick: async () => {
-          const ev = pwa.install; pwa.install = null; ev.prompt(); try { await ev.userChoice; } catch (e) {} openTrip(); }}) : null,
-        standalone() ? h('p', {class: 'hint'}, '홈 화면 앱으로 열려 있습니다.')
-          : h('p', {class: 'hint'}, '홈 화면에 추가하면 앱처럼 열립니다. 아이폰은 Safari의 공유 버튼 → ‘홈 화면에 추가’, 갤럭시는 브라우저 메뉴 → ‘홈 화면에 추가’(또는 ‘앱 설치’)를 누르세요.'),
-        h('p', {class: 'hint'}, navigator.serviceWorker && navigator.serviceWorker.controller
-          ? '앱과 섬 전체 지도 자료가 이 기기에 저장되어 있어 인터넷 없이도 열립니다(주소 검색만 인터넷이 필요합니다). 앱의 새 버전이 나오면 알려 드리고, 새 버전으로 바뀌어도 일정은 그대로 남습니다.'
-          : '처음 연 뒤 잠시 지나면 앱과 지도 자료(약 7MB)가 이 기기에 저장되어, 그다음부터는 인터넷 없이도 열립니다.')),
+      appTop ? null : appSec,
       h('h3', {class: 'group-h'}, '지도 설정'),
       h('div', {class: 'set'}, h('label', null, '지형 높이 과장', exag, ev), opt('도로 표시', 'roads', 'jejumap.roads'), opt('건물과 나무 표시', 'bld', 'jejumap.bld'), opt('지명 표시', 'geo', 'jejumap.geo'),
         h('p', {class: 'hint'}, '지도는 끌어서 옮기고, 두 손가락으로 확대·회전합니다. 컴퓨터에서는 우클릭이나 Shift를 누른 채 끌면 회전과 기울기, 키보드는 방향키·Q/E·R/F·+/−를 씁니다.'),
